@@ -537,17 +537,20 @@ impl App {
             self.focus(i, &ctx);
         }
 
-        Self::label(
-            ui.painter(),
-            avail.left_top() + egui::vec2(10.0, 8.0),
-            egui::Align2::LEFT_TOP,
-            &format!(
-                "{} cameras · arrows + Return or double-click: main stream · Ctrl-,: settings",
-                n
-            ),
-            egui::FontId::proportional(11.0),
-            Self::DIM,
-        );
+        // Settings affordance: a quiet gear in the corner instead of a hint
+        // label — the tooltip carries the shortcut for discovery.
+        let gear = egui::Area::new(egui::Id::new("gear"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+            .show(ui.ctx(), |ui| {
+                ui.add(
+                    egui::Button::new(egui::RichText::new("⚙").size(18.0).color(Self::DIM))
+                        .frame(false),
+                )
+                .on_hover_text("Settings — Ctrl-,")
+            });
+        if gear.inner.clicked() {
+            self.settings_open = true;
+        }
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
