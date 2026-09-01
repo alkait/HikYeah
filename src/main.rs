@@ -117,7 +117,10 @@ struct App {
     settings_open: bool,
     /// Render adapter choice awaiting the restart/cancel confirmation.
     pending_render: Option<Option<String>>,
-    started: Instant,
+    /// Grid keyboard cursor (red border): tile index + when it fades.
+    key_sel: Option<(usize, Instant)>,
+    /// Arrows resume from here (last cursor position or last focused tile).
+    last_key_sel: usize,
 }
 
 /// Stable tile ids for per-tile GPU state: grid substream = index,
@@ -137,7 +140,8 @@ impl App {
             prefs: app_prefs,
             settings_open: false,
             pending_render: None,
-            started: Instant::now(),
+            key_sel: None,
+            last_key_sel: 0,
         };
         let cams = match source {
             Source::Single(name, url) => {
@@ -183,6 +187,8 @@ impl App {
         let c = ctx.clone();
         let main = stream::start(url, self.prefs.hwaccel(), move || c.request_repaint());
         self.focused = Some((idx, main));
+        self.last_key_sel = idx; // arrows resume from here after unfocus
+        self.key_sel = None;
     }
 
     fn unfocus(&mut self) {
@@ -207,17 +213,30 @@ impl App {
             .map(|f| egui::vec2(f.width as f32, f.height as f32))
     }
 
-    fn label(painter: &egui::Painter, pos: egui::Pos2, align: egui::Align2, text: &str, size: f32) {
-        let font = egui::FontId::monospace(size);
-        painter.text(
-            pos + egui::vec2(1.0, 1.0),
-            align,
-            text,
-            font.clone(),
-            egui::Color32::from_black_alpha(200),
+    /// White text on a translucent black pill — the Mac app's overlay style
+    /// (TileView label: white on 55% black; nerd stats: white / dim white).
+    fn label(
+        painter: &egui::Painter,
+        pos: egui::Pos2,
+        align: egui::Align2,
+        text: &str,
+        font: egui::FontId,
+        color: egui::Color32,
+    ) {
+        let galley = painter.layout(text.to_string(), font, color, f32::INFINITY);
+        let rect = align.anchor_size(pos, galley.size());
+        painter.rect_filled(
+            rect.expand2(egui::vec2(5.0, 3.0)),
+            3.0,
+            egui::Color32::from_black_alpha(140),
         );
-        painter.text(pos, align, text, font, egui::Color32::from_rgb(0, 230, 118));
+        painter.galley(rect.min, galley, color);
     }
+
+    const WHITE: egui::Color32 = egui::Color32::from_rgba_premultiplied(240, 240, 240, 255);
+    const DIM: egui::Color32 = egui::Color32::from_rgba_premultiplied(150, 150, 150, 255);
+    /// NSColor.systemRed — the grid keyboard cursor.
+    const CURSOR_RED: egui::Color32 = egui::Color32::from_rgb(255, 59, 48);
 
     fn show_focused(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
         let Some((idx, main)) = &self.focused else { return };
@@ -256,7 +275,29 @@ impl App {
             text += &format!("\nreanchors {}", main_stats.reanchors);
         }
         text += "\nEsc: grid";
-        Self::label(ui.painter(), avail.left_top() + egui::vec2(10.0, 8.0), egui::Align2::LEFT_TOP, &text, 13.0);
+        Self::label(
+            ui.painter(),
+            avail.left_top() + egui::vec2(10.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            &text,
+            egui::FontId::monospace(12.0),
+            Self::WHITE,
+        );
+    }
+
+    /// One arrow press: show the cursor on the last-used tile, or move a
+    /// visible cursor by (dc, dr), clamped to the grid (GridView.swift port).
+    fn move_key_cursor(&mut self, dc: i32, dr: i32, cols: usize) {
+        let n = self.cams.len();
+        let mut i = self.last_key_sel.min(n - 1);
+        if let Some((cur, _)) = self.key_sel {
+            let rows = n.div_ceil(cols);
+            let c = ((cur % cols) as i32 + dc).clamp(0, cols as i32 - 1) as usize;
+            let r = ((cur / cols) as i32 + dr).clamp(0, rows as i32 - 1) as usize;
+            i = (r * cols + c).min(n - 1);
+        }
+        self.last_key_sel = i;
+        self.key_sel = Some((i, Instant::now() + std::time::Duration::from_secs(3)));
     }
 
     fn show_grid(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
@@ -276,7 +317,39 @@ impl App {
         let rows = n.div_ceil(cols);
         let (cw, ch) = (avail.width() / cols as f32, avail.height() / rows as f32);
 
+        // Keyboard navigation: arrows drive the red cursor, Return focuses it,
+        // 5 s of inactivity clears it.
         let mut focus: Option<usize> = None;
+        if !self.settings_open {
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    self.move_key_cursor(-1, 0, cols);
+                }
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    self.move_key_cursor(1, 0, cols);
+                }
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    self.move_key_cursor(0, -1, cols);
+                }
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    self.move_key_cursor(0, 1, cols);
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Some((i, _)) = self.key_sel {
+                    focus = Some(i);
+                }
+            }
+        }
+        if let Some((_, deadline)) = self.key_sel {
+            let now = Instant::now();
+            if now >= deadline {
+                self.key_sel = None;
+            } else {
+                ui.ctx().request_repaint_after(deadline - now);
+            }
+        }
+
         for (i, cam) in self.cams.iter().enumerate() {
             let cell = egui::Rect::from_min_size(
                 avail.left_top() + egui::vec2((i % cols) as f32 * cw, (i / cols) as f32 * ch),
@@ -295,8 +368,18 @@ impl App {
                 rect.left_bottom() + egui::vec2(6.0, -6.0),
                 egui::Align2::LEFT_BOTTOM,
                 &format!("{} — {}", cam.name, status),
-                11.0,
+                egui::FontId::proportional(12.0),
+                Self::WHITE,
             );
+
+            if self.key_sel.is_some_and(|(sel, _)| sel == i) {
+                ui.painter().rect_stroke(
+                    rect.shrink(1.5),
+                    0.0,
+                    egui::Stroke::new(3.0, Self::CURSOR_RED),
+                    egui::StrokeKind::Inside,
+                );
+            }
 
             if cam.main_url.is_some() {
                 let resp = ui.interact(cell, egui::Id::new("tile").with(i), egui::Sense::click());
@@ -315,11 +398,11 @@ impl App {
             avail.left_top() + egui::vec2(10.0, 8.0),
             egui::Align2::LEFT_TOP,
             &format!(
-                "{} cameras · up {:.0}s · double-click: main stream · Ctrl-,: settings",
-                n,
-                self.started.elapsed().as_secs_f32()
+                "{} cameras · arrows + Return or double-click: main stream · Ctrl-,: settings",
+                n
             ),
-            11.0,
+            egui::FontId::proportional(11.0),
+            Self::DIM,
         );
     }
 
@@ -426,15 +509,15 @@ impl App {
     }
 }
 
-/// Spawn a fresh instance (same binary, same args) and close this one; our
-/// Drop stops this instance's ffmpeg children on the way out.
-fn relaunch(ctx: &egui::Context) {
+/// Spawn a fresh instance (same binary, same args) and exit this one on the
+/// spot — our ffmpeg children die on their broken pipes.
+fn relaunch(_ctx: &egui::Context) {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe)
             .args(std::env::args().skip(1))
             .spawn();
     }
-    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    std::process::exit(0);
 }
 
 impl Drop for App {
@@ -448,6 +531,12 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Close instantly: every ffmpeg dies on its broken stdout pipe the
+        // moment we're gone (PDEATHSIG covers stalled ones on Linux), and
+        // prefs are saved when changed — nothing needs a graceful path.
+        if ui.input(|i| i.viewport().close_requested()) {
+            std::process::exit(0);
+        }
         let ctx = ui.ctx().clone();
         if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Comma)) {
             self.settings_open = !self.settings_open;

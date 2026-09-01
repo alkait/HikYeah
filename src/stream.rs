@@ -186,6 +186,18 @@ fn run_once(
     });
     cmd.stdin(Stdio::null());
 
+    // Belt-and-braces on Linux: the kernel kills ffmpeg the instant we die,
+    // covering even a stalled one that never hits its broken stdout pipe.
+    // (Windows will use a Job Object; macOS relies on the pipe alone.)
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+
     let mut child = cmd.spawn().map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
     let mut out = child.stdout.take().unwrap();
     *sh.child.lock().unwrap() = Some(child);
