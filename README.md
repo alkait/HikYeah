@@ -19,7 +19,9 @@ cargo build --release
 ./target/release/hikyeah           # first camera from config (below)
 ```
 
-Requires `ffmpeg` on PATH. With no arguments it reads
+Uses the `ffmpeg` sitting next to the executable if there is one (release
+archives bundle a static build), else `ffmpeg` from PATH. With no arguments it
+reads
 `~/.config/hikviewer/config.json` — the same JSON the Mac app's
 File > Export produces, so an exported config can be dropped there unchanged.
 

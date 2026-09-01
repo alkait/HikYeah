@@ -118,6 +118,21 @@ impl Shared {
     }
 }
 
+/// The ffmpeg to launch: a bundled one next to our executable (release
+/// archives ship it) wins over whatever is on PATH.
+pub fn ffmpeg_path() -> std::path::PathBuf {
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(name)))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| name.into())
+}
+
 /// Spawn the supervisor thread: launch ffmpeg, pump frames, relaunch on exit.
 /// `hwaccel` is the user's decode choice (ffmpeg -hwaccel value; None = CPU).
 /// `wake` is called after each published frame (UI repaint).
@@ -163,7 +178,7 @@ fn run_once(
     wake: &(impl Fn() + Send),
 ) -> Result<(), String> {
     let launch = Instant::now();
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_path());
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     if url == "--test" {
         // Synthetic source: full pipeline minus the camera (dev/demo).

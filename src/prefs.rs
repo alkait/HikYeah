@@ -122,7 +122,7 @@ pub fn start_probe() {
                     std::thread::spawn(move || {
                         // A broken driver can hang device init forever (seen
                         // with vaapi on hybrid NVIDIA setups) — kill after 5 s.
-                        let ok = std::process::Command::new("ffmpeg")
+                        let ok = std::process::Command::new(crate::stream::ffmpeg_path())
                             .args(["-hide_banner", "-v", "error", "-nostdin"])
                             .args(["-init_hw_device", &format!("{hw}=probe")])
                             .args(["-hwaccel", hw, "-i"])
@@ -176,7 +176,7 @@ fn probe_sample() -> Option<std::path::PathBuf> {
         return Some(path);
     }
     std::fs::create_dir_all(&dir).ok()?;
-    let ok = std::process::Command::new("ffmpeg")
+    let ok = std::process::Command::new(crate::stream::ffmpeg_path())
         .args(["-hide_banner", "-v", "error", "-nostdin"])
         .args([
             "-f",

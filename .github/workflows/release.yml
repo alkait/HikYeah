@@ -1,0 +1,81 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # dry run: builds + uploads artifacts, no release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      # Static ffmpeg per OS (spawned as a child process, not linked):
+      # Linux/Windows from BtbN's GPL builds (pinned to the 8.1 branch),
+      # macOS arm64 from martin-riedl.de. LICENSE/NOTICE ship in the archive.
+      - name: Bundle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir "$dir"
+          curl -fsSL -o ff.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
+          tar xf ff.tar.xz
+          cp ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffmpeg "$dir/"
+          cp ffmpeg-n8.1-latest-linux64-gpl-8.1/LICENSE.txt "$dir/FFMPEG-LICENSE.txt"
+          echo "Bundled ffmpeg: GPL build from https://github.com/BtbN/FFmpeg-Builds (source: https://ffmpeg.org)" > "$dir/FFMPEG-NOTICE.txt"
+          cp target/release/hikyeah "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir "$dir"
+          curl -fsSL -A "Mozilla/5.0" -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip
+          unzip -o ff.zip -d ffdl
+          cp ffdl/ffmpeg "$dir/"
+          chmod +x "$dir/ffmpeg"
+          echo "Bundled ffmpeg: GPL build from https://ffmpeg.martin-riedl.de (source: https://ffmpeg.org, license: https://ffmpeg.org/legal.html)" > "$dir/FFMPEG-NOTICE.txt"
+          cp target/release/hikyeah "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir "$dir"
+          curl -fsSL -o ff.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip
+          tar xf ff.zip
+          cp ffmpeg-n8.1-latest-win64-gpl-8.1/bin/ffmpeg.exe "$dir/"
+          cp ffmpeg-n8.1-latest-win64-gpl-8.1/LICENSE.txt "$dir/FFMPEG-LICENSE.txt"
+          echo "Bundled ffmpeg: GPL build from https://github.com/BtbN/FFmpeg-Builds (source: https://ffmpeg.org)" > "$dir/FFMPEG-NOTICE.txt"
+          cp target/release/hikyeah.exe "$dir/"
+          7z a "$dir.zip" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hikyeah-${{ matrix.target }}
+          path: hikyeah-*-${{ matrix.target }}.*
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hikyeah-*-${{ matrix.target }}.*
