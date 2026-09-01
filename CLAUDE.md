@@ -13,4 +13,5 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 - Fail fast on bugs (panic on violated invariants — don't catch). For environmental failures (camera offline, network, ffmpeg exit), degrade visibly and retry: show status on the affected tile, never take down the app, never swallow an error without a status or log signal.
 - Comments explain constraints and Mac-app ports (why), not what the code does.
 - Guard platform-specific code with `cfg(target_os)`; only Linux is exercised today, so double-check macOS/Windows paths compile.
-- No tests for now; no CI yet (to be discussed).
+- Releases bundle a static ffmpeg pinned to a major branch (BtbN `n8.1-latest`): patches flow in automatically, majors bump only when the user asks. The macOS source is knowingly unpinned until there are Mac users.
+- No tests for now.
