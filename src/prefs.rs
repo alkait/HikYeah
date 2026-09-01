@@ -25,7 +25,11 @@ fn default_true() -> bool {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { decode: String::new(), render_adapter: None, smooth_live: true }
+        Prefs {
+            decode: String::new(),
+            render_adapter: None,
+            smooth_live: true,
+        }
     }
 }
 
@@ -41,22 +45,62 @@ pub struct DecodeOption {
 pub fn decode_options() -> &'static [DecodeOption] {
     #[cfg(target_os = "linux")]
     return &[
-        DecodeOption { id: "cpu", label: "CPU (software)", hwaccel: None },
-        DecodeOption { id: "cuda", label: "NVDEC (NVIDIA)", hwaccel: Some("cuda") },
-        DecodeOption { id: "qsv", label: "Quick Sync (Intel)", hwaccel: Some("qsv") },
-        DecodeOption { id: "vaapi", label: "VAAPI (Intel/AMD)", hwaccel: Some("vaapi") },
+        DecodeOption {
+            id: "cpu",
+            label: "CPU (software)",
+            hwaccel: None,
+        },
+        DecodeOption {
+            id: "cuda",
+            label: "NVDEC (NVIDIA)",
+            hwaccel: Some("cuda"),
+        },
+        DecodeOption {
+            id: "qsv",
+            label: "Quick Sync (Intel)",
+            hwaccel: Some("qsv"),
+        },
+        DecodeOption {
+            id: "vaapi",
+            label: "VAAPI (Intel/AMD)",
+            hwaccel: Some("vaapi"),
+        },
     ];
     #[cfg(target_os = "macos")]
     return &[
-        DecodeOption { id: "cpu", label: "CPU (software)", hwaccel: None },
-        DecodeOption { id: "videotoolbox", label: "VideoToolbox", hwaccel: Some("videotoolbox") },
+        DecodeOption {
+            id: "cpu",
+            label: "CPU (software)",
+            hwaccel: None,
+        },
+        DecodeOption {
+            id: "videotoolbox",
+            label: "VideoToolbox",
+            hwaccel: Some("videotoolbox"),
+        },
     ];
     #[cfg(target_os = "windows")]
     return &[
-        DecodeOption { id: "cpu", label: "CPU (software)", hwaccel: None },
-        DecodeOption { id: "d3d11va", label: "Direct3D 11 VA", hwaccel: Some("d3d11va") },
-        DecodeOption { id: "cuda", label: "NVDEC (NVIDIA)", hwaccel: Some("cuda") },
-        DecodeOption { id: "qsv", label: "Quick Sync (Intel)", hwaccel: Some("qsv") },
+        DecodeOption {
+            id: "cpu",
+            label: "CPU (software)",
+            hwaccel: None,
+        },
+        DecodeOption {
+            id: "d3d11va",
+            label: "Direct3D 11 VA",
+            hwaccel: Some("d3d11va"),
+        },
+        DecodeOption {
+            id: "cuda",
+            label: "NVDEC (NVIDIA)",
+            hwaccel: Some("cuda"),
+        },
+        DecodeOption {
+            id: "qsv",
+            label: "Quick Sync (Intel)",
+            hwaccel: Some("qsv"),
+        },
     ];
 }
 
@@ -89,15 +133,15 @@ pub fn start_probe() {
                             .spawn()
                             .ok()
                             .is_some_and(|mut child| {
-                                let deadline = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(5);
+                                let deadline =
+                                    std::time::Instant::now() + std::time::Duration::from_secs(5);
                                 loop {
                                     match child.try_wait() {
                                         Ok(Some(status)) => return status.success(),
                                         Ok(None) if std::time::Instant::now() < deadline => {
-                                            std::thread::sleep(
-                                                std::time::Duration::from_millis(100),
-                                            );
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                100,
+                                            ));
                                         }
                                         _ => {
                                             let _ = child.kill();
@@ -134,7 +178,14 @@ fn probe_sample() -> Option<std::path::PathBuf> {
     std::fs::create_dir_all(&dir).ok()?;
     let ok = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-v", "error", "-nostdin"])
-        .args(["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25", "-t", "1"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=25",
+            "-t",
+            "1",
+        ])
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-y"])
         .arg(&path)
         .status()
@@ -149,8 +200,8 @@ pub fn available_decode_options() -> Vec<&'static DecodeOption> {
     decode_options()
         .iter()
         .filter(|o| match (o.hwaccel, probed) {
-            (None, _) => true,          // CPU
-            (Some(_), None) => true,    // probe pending/unavailable: show all
+            (None, _) => true,       // CPU
+            (Some(_), None) => true, // probe pending/unavailable: show all
             (Some(hw), Some(ids)) => ids.contains(&hw),
         })
         .collect()
@@ -158,7 +209,10 @@ pub fn available_decode_options() -> Vec<&'static DecodeOption> {
 
 impl Prefs {
     pub fn hwaccel(&self) -> Option<&'static str> {
-        decode_options().iter().find(|o| o.id == self.decode).and_then(|o| o.hwaccel)
+        decode_options()
+            .iter()
+            .find(|o| o.id == self.decode)
+            .and_then(|o| o.hwaccel)
     }
 
     pub fn decode_label(&self) -> &'static str {

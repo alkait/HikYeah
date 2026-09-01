@@ -34,7 +34,6 @@ pub struct Frame {
     pub due: Instant,
 }
 
-
 #[derive(Default, Clone)]
 pub struct Stats {
     pub status: String,
@@ -171,7 +170,14 @@ fn run_once(
         // -re paces lavfi at realtime, like a camera would.
         cmd.args(["-re", "-f", "lavfi", "-i", "testsrc2=size=704x576:rate=25"]);
     } else {
-        cmd.args(["-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay"]);
+        cmd.args([
+            "-rtsp_transport",
+            "tcp",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+        ]);
         if let Some(hw) = hwaccel {
             cmd.args(["-hwaccel", hw]);
         }
@@ -198,7 +204,9 @@ fn run_once(
         });
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
     let mut out = child.stdout.take().unwrap();
     *sh.child.lock().unwrap() = Some(child);
 
@@ -239,30 +247,34 @@ fn run_once(
         }
         read_line(&mut out)?; // "FRAME" (+ optional params)
         let mut yuv = sh.take_buffer(frame_len);
-        out.read_exact(&mut yuv).map_err(|e| format!("pipe closed: {e}"))?;
+        out.read_exact(&mut yuv)
+            .map_err(|e| format!("pipe closed: {e}"))?;
         seq += 1;
 
         // Burst arrivals (gap ≈ 0) are real data — the mean of the gaps is
         // the true frame interval. Cap only stall outliers.
         let now = epoch.elapsed().as_secs_f64();
-        let gap = if last_arrival >= 0.0 { now - last_arrival } else { 0.0 };
+        let gap = if last_arrival >= 0.0 {
+            now - last_arrival
+        } else {
+            0.0
+        };
         if last_arrival >= 0.0 {
-            frame_gap =
-                (frame_gap + 0.03 * (gap.min(0.35) - frame_gap)).clamp(1.0 / 120.0, 0.35);
+            frame_gap = (frame_gap + 0.03 * (gap.min(0.35) - frame_gap)).clamp(1.0 / 120.0, 0.35);
         }
         last_arrival = now;
 
         let smoothing = SMOOTH.load(Ordering::Relaxed);
         let mut reanchored = false;
         let due = if smoothing {
-            let mut t =
-                if next_pts < 0.0 { now + SMOOTHING_DELAY } else { next_pts + frame_gap };
+            let mut t = if next_pts < 0.0 {
+                now + SMOOTHING_DELAY
+            } else {
+                next_pts + frame_gap
+            };
             // Re-anchor when the schedule drains (frame would show late) or
             // runs ahead of the buffer bound — one brief hiccup, then smooth.
-            if next_pts >= 0.0 && t < now + 0.005 {
-                reanchored = true;
-                t = now + SMOOTHING_DELAY;
-            } else if next_pts >= 0.0 && t > now + SMOOTHING_DELAY + 0.3 {
+            if next_pts >= 0.0 && (t < now + 0.005 || t > now + SMOOTHING_DELAY + 0.3) {
                 reanchored = true;
                 t = now + SMOOTHING_DELAY;
             }
@@ -272,7 +284,13 @@ fn run_once(
             next_pts = -1.0;
             Instant::now()
         };
-        sh.publish(Frame { width: w, height: h, yuv, seq, due });
+        sh.publish(Frame {
+            width: w,
+            height: h,
+            yuv,
+            seq,
+            due,
+        });
 
         win_frames += 1;
         {
@@ -300,7 +318,8 @@ fn read_line(r: &mut impl Read) -> Result<String, String> {
     let mut line = Vec::with_capacity(80);
     let mut b = [0u8; 1];
     loop {
-        r.read_exact(&mut b).map_err(|e| format!("pipe closed: {e}"))?;
+        r.read_exact(&mut b)
+            .map_err(|e| format!("pipe closed: {e}"))?;
         if b[0] == b'\n' {
             return String::from_utf8(line).map_err(|_| "non-utf8 y4m header".into());
         }
@@ -310,4 +329,3 @@ fn read_line(r: &mut impl Read) -> Result<String, String> {
         }
     }
 }
-

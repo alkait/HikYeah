@@ -33,7 +33,12 @@ fn main() -> eframe::Result {
         }
         None => {
             let cams: Vec<config::StoredCamera> = config::load()
-                .map(|c| c.cameras.into_iter().filter(|c| !c.host.is_empty()).collect())
+                .map(|c| {
+                    c.cameras
+                        .into_iter()
+                        .filter(|c| !c.host.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
             if cams.is_empty() {
                 eprintln!(
@@ -169,7 +174,11 @@ impl App {
                 app.cams = stored
                     .iter()
                     .map(|c| Cam {
-                        name: if c.name.is_empty() { c.host.clone() } else { c.name.clone() },
+                        name: if c.name.is_empty() {
+                            c.host.clone()
+                        } else {
+                            c.name.clone()
+                        },
                         host: c.host.clone(),
                         sub_url: config::rtsp_url(c, config::SUB_CHANNEL),
                         main_url: Some(config::rtsp_url(c, config::MAIN_CHANNEL)),
@@ -202,13 +211,14 @@ impl App {
         // Reopen where the user left off (SessionStore port): a focused
         // camera comes straight back, snapshot/substream bridging the wait.
         let st = session::load();
-        if st.location == "camera" {
-            if let Some(idx) = st
-                .camera_host
-                .and_then(|h| app.cams.iter().position(|c| !c.host.is_empty() && c.host == h))
-            {
-                app.focus(idx, &cc.egui_ctx);
-            }
+        if st.location == "camera"
+            && let Some(idx) = st.camera_host.and_then(|h| {
+                app.cams
+                    .iter()
+                    .position(|c| !c.host.is_empty() && c.host == h)
+            })
+        {
+            app.focus(idx, &cc.egui_ctx);
         }
         app
     }
@@ -234,7 +244,9 @@ impl App {
     }
 
     fn focus(&mut self, idx: usize, ctx: &egui::Context) {
-        let Some(url) = self.cams[idx].main_url.clone() else { return };
+        let Some(url) = self.cams[idx].main_url.clone() else {
+            return;
+        };
         let c = ctx.clone();
         let main = stream::start(url, self.prefs.hwaccel(), move || c.request_repaint());
         self.focused = Some((idx, main));
@@ -327,7 +339,9 @@ impl App {
     const CURSOR_RED: egui::Color32 = egui::Color32::from_rgb(255, 59, 48);
 
     fn show_focused(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
-        let Some((idx, main)) = &self.focused else { return };
+        let Some((idx, main)) = &self.focused else {
+            return;
+        };
         let (idx, main) = (*idx, main.clone());
         let cam = &self.cams[idx];
         let main_stats = main.stats.lock().unwrap().clone();
@@ -344,10 +358,11 @@ impl App {
         let dims = Self::frame_dims(&shared);
         if dims.is_some() {
             let rect = Self::fit(avail, dims);
-            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
-                rect,
-                render::VideoCallback { id, shared },
-            ));
+            ui.painter()
+                .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    render::VideoCallback { id, shared },
+                ));
         } else if let Some((tex, cached)) = &cam.placeholder {
             Self::draw_placeholder(ui.painter(), avail, tex, *cached);
         }
@@ -412,10 +427,10 @@ impl App {
                     self.move_key_cursor(0, 1, cols);
                 }
             });
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some((i, _)) = self.key_sel {
-                    focus = Some(i);
-                }
+            if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && let Some((i, _)) = self.key_sel
+            {
+                focus = Some(i);
             }
         }
         if let Some((_, deadline)) = self.key_sel {
@@ -437,10 +452,14 @@ impl App {
             let rect = match (dims, &cam.placeholder) {
                 (Some(d), _) => {
                     let rect = Self::fit(cell, Some(d));
-                    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
-                        rect,
-                        render::VideoCallback { id: i as u64, shared: cam.shared.clone() },
-                    ));
+                    ui.painter()
+                        .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                            rect,
+                            render::VideoCallback {
+                                id: i as u64,
+                                shared: cam.shared.clone(),
+                            },
+                        ));
                     rect
                 }
                 (None, Some((tex, cached))) => {
@@ -505,12 +524,10 @@ impl App {
                 let current = self.prefs.decode_label();
                 let mut options = prefs::available_decode_options();
                 // Keep the active choice visible even if the probe ruled it out.
-                if !options.iter().any(|o| o.label == current) {
-                    if let Some(cur) =
-                        prefs::decode_options().iter().find(|o| o.label == current)
-                    {
-                        options.push(cur);
-                    }
+                if !options.iter().any(|o| o.label == current)
+                    && let Some(cur) = prefs::decode_options().iter().find(|o| o.label == current)
+                {
+                    options.push(cur);
                 }
                 egui::ComboBox::from_id_salt("decode")
                     .selected_text(current)
@@ -632,7 +649,9 @@ impl eframe::App for App {
                 cam.placeholder = Some((tex, false));
             }
         }
-        if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Comma)) {
+        if ui
+            .input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Comma))
+        {
             self.settings_open = !self.settings_open;
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {

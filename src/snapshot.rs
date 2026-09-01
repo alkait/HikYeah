@@ -52,7 +52,10 @@ fn fetch(cam: &StoredCamera, channel: &str) -> Option<Vec<u8>> {
         Err(_) => return None,
     };
     let mut jpeg = Vec::new();
-    resp.into_reader().take(20 << 20).read_to_end(&mut jpeg).ok()?;
+    resp.into_reader()
+        .take(20 << 20)
+        .read_to_end(&mut jpeg)
+        .ok()?;
     // Cameras answer errors as XML bodies with status 200 sometimes — accept
     // only something that looks like a JPEG.
     (jpeg.len() > 4 && jpeg[..2] == [0xFF, 0xD8]).then_some(jpeg)
@@ -68,7 +71,9 @@ pub fn spawn_fetch(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let Some(jpeg) = fetch(&cam, channel) else { return };
+        let Some(jpeg) = fetch(&cam, channel) else {
+            return;
+        };
         if let Some(path) = cache_path(&cam.host) {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -78,10 +83,10 @@ pub fn spawn_fetch(
                 let _ = std::fs::rename(&tmp, &path);
             }
         }
-        if let Some(img) = decode(&jpeg) {
-            if tx.send((idx, img)).is_ok() {
-                ctx.request_repaint();
-            }
+        if let Some(img) = decode(&jpeg)
+            && tx.send((idx, img)).is_ok()
+        {
+            ctx.request_repaint();
         }
     });
 }

@@ -145,12 +145,21 @@ impl VideoRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        VideoRenderer { pipeline, layout, sampler, tiles: HashMap::new() }
+        VideoRenderer {
+            pipeline,
+            layout,
+            sampler,
+            tiles: HashMap::new(),
+        }
     }
 
     fn ensure_planes(&mut self, id: u64, device: &wgpu::Device, w: usize, h: usize) {
         let tile = self.tiles.entry(id).or_default();
-        if tile.planes.as_ref().is_some_and(|p| p.width == w && p.height == h) {
+        if tile
+            .planes
+            .as_ref()
+            .is_some_and(|p| p.width == w && p.height == h)
+        {
             return;
         }
         let make = |pw: usize, ph: usize| {
@@ -171,7 +180,10 @@ impl VideoRenderer {
         };
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let tex = [make(w, h), make(cw, ch), make(cw, ch)];
-        let views: Vec<_> = tex.iter().map(|t| t.create_view(&Default::default())).collect();
+        let views: Vec<_> = tex
+            .iter()
+            .map(|t| t.create_view(&Default::default()))
+            .collect();
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("video"),
             layout: &self.layout,
@@ -195,7 +207,12 @@ impl VideoRenderer {
             ],
         });
         let tile = self.tiles.get_mut(&id).unwrap();
-        tile.planes = Some(Planes { width: w, height: h, tex, bind });
+        tile.planes = Some(Planes {
+            width: w,
+            height: h,
+            tex,
+            bind,
+        });
         tile.uploaded_seq = 0;
     }
 
@@ -267,12 +284,12 @@ impl egui_wgpu::CallbackTrait for VideoCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let r: &VideoRenderer = resources.get().expect("VideoRenderer registered");
-        if let Some(tile) = r.tiles.get(&self.id) {
-            if let (Some(p), true) = (&tile.planes, tile.uploaded_seq > 0) {
-                render_pass.set_pipeline(&r.pipeline);
-                render_pass.set_bind_group(0, &p.bind, &[]);
-                render_pass.draw(0..3, 0..1);
-            }
+        if let Some(tile) = r.tiles.get(&self.id)
+            && let (Some(p), true) = (&tile.planes, tile.uploaded_seq > 0)
+        {
+            render_pass.set_pipeline(&r.pipeline);
+            render_pass.set_bind_group(0, &p.bind, &[]);
+            render_pass.draw(0..3, 0..1);
         }
     }
 }
