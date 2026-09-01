@@ -52,6 +52,11 @@ fn main() -> eframe::Result {
         }
     };
 
+    #[cfg(target_os = "linux")]
+    let instance_lock = single_instance_lock();
+    #[cfg(not(target_os = "linux"))]
+    let instance_lock: Option<std::fs::File> = None;
+
     let app_prefs = prefs::Prefs::load();
     stream::SMOOTH.store(app_prefs.smooth_live, std::sync::atomic::Ordering::Relaxed);
     prefs::start_probe();
@@ -97,7 +102,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "HikYeah",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, source, app_prefs)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, source, app_prefs, instance_lock)))),
     )
 }
 
@@ -135,6 +140,8 @@ struct App {
     last_key_sel: usize,
     /// Fresh snapshots arriving from the background ISAPI fetches.
     snap_rx: std::sync::mpsc::Receiver<(usize, egui::ColorImage)>,
+    /// Held for our lifetime; handed to relaunch() so the successor can take it.
+    instance_lock: Option<std::fs::File>,
 }
 
 /// Stable tile ids for per-tile GPU state: grid substream = index,
@@ -142,7 +149,12 @@ struct App {
 const MAIN_BIT: u64 = 1 << 32;
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, source: Source, app_prefs: prefs::Prefs) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        source: Source,
+        app_prefs: prefs::Prefs,
+        instance_lock: Option<std::fs::File>,
+    ) -> Self {
         let rs = cc.wgpu_render_state.as_ref().expect("wgpu render state");
         rs.renderer
             .write()
@@ -158,6 +170,7 @@ impl App {
             key_sel: None,
             last_key_sel: 0,
             snap_rx,
+            instance_lock,
         };
         match source {
             Source::Single(name, url) => {
@@ -602,7 +615,7 @@ impl App {
                             self.prefs.render_adapter = pending.clone();
                             self.prefs.save();
                             self.pending_render = None;
-                            relaunch(ctx);
+                            relaunch(self.instance_lock.take());
                         }
                         if ui.button("Cancel").clicked() {
                             self.pending_render = None;
@@ -613,9 +626,41 @@ impl App {
     }
 }
 
+/// One instance per user: a duplicate would double every camera's RTSP
+/// connections (cameras cap those) and the decode load. The kernel releases
+/// the flock with the process, so a crash never leaves it stale. macOS gets
+/// this free from LaunchServices once we ship a .app; Windows will want a
+/// named mutex.
+#[cfg(target_os = "linux")]
+fn single_instance_lock() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("hikyeah-{}.lock", unsafe { libc::getuid() }));
+    match std::fs::File::create(&path) {
+        Ok(f) => {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                eprintln!("HikYeah is already running ({} is locked)", path.display());
+                std::process::exit(1);
+            }
+            Some(f)
+        }
+        Err(e) => {
+            eprintln!(
+                "[warn] no single-instance lock ({}: {e}) — running anyway",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Spawn a fresh instance (same binary, same args) and exit this one on the
-/// spot — our ffmpeg children die on their broken pipes.
-fn relaunch(_ctx: &egui::Context) {
+/// spot — our ffmpeg children die on their broken pipes. Takes the instance
+/// lock so it's released before the successor checks it.
+fn relaunch(lock: Option<std::fs::File>) -> ! {
+    drop(lock);
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe)
             .args(std::env::args().skip(1))
