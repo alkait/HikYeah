@@ -14,6 +14,8 @@
 mod config;
 mod prefs;
 mod render;
+mod session;
+mod snapshot;
 mod stream;
 
 use eframe::egui;
@@ -104,9 +106,14 @@ enum Source {
 /// main stream when focused.
 struct Cam {
     name: String,
+    /// Identifies the camera across launches and reorders (session state).
+    host: String,
     sub_url: String,
     main_url: Option<String>,
     shared: Arc<stream::Shared>,
+    /// JPEG shown until the first live frame: last-known from disk
+    /// (true = "cached", dimmed + badged) or a fresh ISAPI snapshot (false).
+    placeholder: Option<(egui::TextureHandle, bool)>,
 }
 
 struct App {
@@ -121,6 +128,8 @@ struct App {
     key_sel: Option<(usize, Instant)>,
     /// Arrows resume from here (last cursor position or last focused tile).
     last_key_sel: usize,
+    /// Fresh snapshots arriving from the background ISAPI fetches.
+    snap_rx: std::sync::mpsc::Receiver<(usize, egui::ColorImage)>,
 }
 
 /// Stable tile ids for per-tile GPU state: grid substream = index,
@@ -134,6 +143,7 @@ impl App {
             .write()
             .callback_resources
             .insert(render::VideoRenderer::new(&rs.device, rs.target_format));
+        let (tx, snap_rx) = std::sync::mpsc::channel();
         let mut app = App {
             cams: Vec::new(),
             focused: None,
@@ -142,23 +152,64 @@ impl App {
             pending_render: None,
             key_sel: None,
             last_key_sel: 0,
+            snap_rx,
         };
-        let cams = match source {
+        match source {
             Source::Single(name, url) => {
-                vec![Cam { name, sub_url: url, main_url: None, shared: Default::default() }]
-            }
-            Source::Config(stored) => stored
-                .iter()
-                .map(|c| Cam {
-                    name: if c.name.is_empty() { c.host.clone() } else { c.name.clone() },
-                    sub_url: config::rtsp_url(c, config::SUB_CHANNEL),
-                    main_url: Some(config::rtsp_url(c, config::MAIN_CHANNEL)),
+                app.cams = vec![Cam {
+                    name,
+                    host: String::new(),
+                    sub_url: url,
+                    main_url: None,
                     shared: Default::default(),
-                })
-                .collect(),
-        };
-        app.cams = cams;
+                    placeholder: None,
+                }];
+            }
+            Source::Config(stored) => {
+                app.cams = stored
+                    .iter()
+                    .map(|c| Cam {
+                        name: if c.name.is_empty() { c.host.clone() } else { c.name.clone() },
+                        host: c.host.clone(),
+                        sub_url: config::rtsp_url(c, config::SUB_CHANNEL),
+                        main_url: Some(config::rtsp_url(c, config::MAIN_CHANNEL)),
+                        shared: Default::default(),
+                        placeholder: None,
+                    })
+                    .collect();
+                for (i, c) in stored.iter().enumerate() {
+                    // Instant: last-known cached frame (marked cached, possibly stale).
+                    if let Some(img) = snapshot::load_cached(&c.host) {
+                        let tex = cc.egui_ctx.load_texture(
+                            format!("snap{i}"),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        app.cams[i].placeholder = Some((tex, true));
+                    }
+                    // Fresh: live snapshot replaces it and refreshes the cache.
+                    snapshot::spawn_fetch(
+                        c.clone(),
+                        i,
+                        config::SUB_CHANNEL,
+                        tx.clone(),
+                        cc.egui_ctx.clone(),
+                    );
+                }
+            }
+        }
         app.start_streams(&cc.egui_ctx);
+        // Reopen where the user left off (SessionStore port): a focused
+        // camera comes straight back, snapshot/substream bridging the wait.
+        let st = session::load();
+        if st.location == "camera" {
+            if let Some(idx) = st
+                .camera_host
+                .and_then(|h| app.cams.iter().position(|c| !c.host.is_empty() && c.host == h))
+            {
+                app.focus(idx, &cc.egui_ctx);
+            }
+        }
         app
     }
 
@@ -189,11 +240,15 @@ impl App {
         self.focused = Some((idx, main));
         self.last_key_sel = idx; // arrows resume from here after unfocus
         self.key_sel = None;
+        if !self.cams[idx].host.is_empty() {
+            session::save("camera", Some(&self.cams[idx].host));
+        }
     }
 
     fn unfocus(&mut self) {
         if let Some((_, main)) = self.focused.take() {
             main.stop();
+            session::save("grid", None);
         }
     }
 
@@ -233,6 +288,39 @@ impl App {
         painter.galley(rect.min, galley, color);
     }
 
+    /// Placeholder JPEG, aspect-fit in `cell`; a cached one is dimmed to 75%
+    /// and badged so it's never mistaken for live (TileView.setPlaceholder).
+    fn draw_placeholder(
+        painter: &egui::Painter,
+        cell: egui::Rect,
+        tex: &egui::TextureHandle,
+        cached: bool,
+    ) -> egui::Rect {
+        let rect = Self::fit(cell, Some(tex.size_vec2()));
+        let tint = if cached {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 191)
+        } else {
+            egui::Color32::WHITE
+        };
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            tint,
+        );
+        if cached {
+            Self::label(
+                painter,
+                rect.right_top() + egui::vec2(-6.0, 6.0),
+                egui::Align2::RIGHT_TOP,
+                "cached",
+                egui::FontId::proportional(10.0),
+                Self::WHITE,
+            );
+        }
+        rect
+    }
+
     const WHITE: egui::Color32 = egui::Color32::from_rgba_premultiplied(240, 240, 240, 255);
     const DIM: egui::Color32 = egui::Color32::from_rgba_premultiplied(150, 150, 150, 255);
     /// NSColor.systemRed — the grid keyboard cursor.
@@ -245,42 +333,31 @@ impl App {
         let main_stats = main.stats.lock().unwrap().clone();
 
         // Main stream once it has a frame on screen; the substream's picture
-        // as a stand-in while it connects (the Mac app's cached-frame trick).
+        // as a stand-in while it connects (the Mac app's cached-frame trick),
+        // and the snapshot placeholder before even that.
         let main_showing = main.current.lock().unwrap().is_some();
-        let (id, shared, live) = if main_showing {
-            (idx as u64 | MAIN_BIT, main.clone(), true)
+        let (id, shared) = if main_showing {
+            (idx as u64 | MAIN_BIT, main.clone())
         } else {
-            (idx as u64, self.cams[idx].shared.clone(), false)
+            (idx as u64, self.cams[idx].shared.clone())
         };
-        let rect = Self::fit(avail, Self::frame_dims(&shared));
-        ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
-            rect,
-            render::VideoCallback { id, shared },
-        ));
+        let dims = Self::frame_dims(&shared);
+        if dims.is_some() {
+            let rect = Self::fit(avail, dims);
+            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
+                rect,
+                render::VideoCallback { id, shared },
+            ));
+        } else if let Some((tex, cached)) = &cam.placeholder {
+            Self::draw_placeholder(ui.painter(), avail, tex, *cached);
+        }
 
-        let mut text = format!("{} — {}", cam.name, main_stats.status);
-        if !live {
-            text += " (substream)";
-        }
-        if main_stats.frames > 0 {
-            text += &format!("\n{:.1} fps · {} frames", main_stats.fps, main_stats.frames);
-            if let Some(t) = main_stats.first_frame_secs {
-                text += &format!(" · first frame {t:.2}s");
-            }
-        }
-        if main_stats.reconnects > 0 {
-            text += &format!("\nreconnects {}", main_stats.reconnects);
-        }
-        if main_stats.reanchors > 0 {
-            text += &format!("\nreanchors {}", main_stats.reanchors);
-        }
-        text += "\nEsc: grid";
         Self::label(
             ui.painter(),
             avail.left_top() + egui::vec2(10.0, 8.0),
             egui::Align2::LEFT_TOP,
-            &text,
-            egui::FontId::monospace(12.0),
+            &format!("{} — {}", cam.name, main_stats.status),
+            egui::FontId::proportional(12.0),
             Self::WHITE,
         );
     }
@@ -297,7 +374,7 @@ impl App {
             i = (r * cols + c).min(n - 1);
         }
         self.last_key_sel = i;
-        self.key_sel = Some((i, Instant::now() + std::time::Duration::from_secs(3)));
+        self.key_sel = Some((i, Instant::now() + std::time::Duration::from_secs(2)));
     }
 
     fn show_grid(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
@@ -356,11 +433,21 @@ impl App {
                 egui::vec2(cw, ch),
             )
             .shrink(1.0);
-            let rect = Self::fit(cell, Self::frame_dims(&cam.shared));
-            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
-                rect,
-                render::VideoCallback { id: i as u64, shared: cam.shared.clone() },
-            ));
+            let dims = Self::frame_dims(&cam.shared);
+            let rect = match (dims, &cam.placeholder) {
+                (Some(d), _) => {
+                    let rect = Self::fit(cell, Some(d));
+                    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        render::VideoCallback { id: i as u64, shared: cam.shared.clone() },
+                    ));
+                    rect
+                }
+                (None, Some((tex, cached))) => {
+                    Self::draw_placeholder(ui.painter(), cell, tex, *cached)
+                }
+                (None, None) => Self::fit(cell, None),
+            };
 
             let status = cam.shared.stats.lock().unwrap().status.clone();
             Self::label(
@@ -538,6 +625,13 @@ impl eframe::App for App {
             std::process::exit(0);
         }
         let ctx = ui.ctx().clone();
+        // Fresh ISAPI snapshots replace the cached placeholders, unbadged.
+        while let Ok((idx, img)) = self.snap_rx.try_recv() {
+            let tex = ctx.load_texture(format!("snap{idx}"), img, egui::TextureOptions::LINEAR);
+            if let Some(cam) = self.cams.get_mut(idx) {
+                cam.placeholder = Some((tex, false));
+            }
+        }
         if ui.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Comma)) {
             self.settings_open = !self.settings_open;
         }

@@ -59,7 +59,6 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-#[allow(dead_code)]
 pub const SUB_CHANNEL: &str = "102"; // grid feed (substream)
 pub const MAIN_CHANNEL: &str = "101"; // focused-tile feed (main stream)
 
