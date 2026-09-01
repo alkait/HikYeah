@@ -17,6 +17,7 @@ mod render;
 mod session;
 mod snapshot;
 mod stream;
+mod update;
 
 use eframe::egui;
 use std::sync::Arc;
@@ -142,6 +143,20 @@ struct App {
     snap_rx: std::sync::mpsc::Receiver<(usize, egui::ColorImage)>,
     /// Held for our lifetime; handed to relaunch() so the successor can take it.
     instance_lock: Option<std::fs::File>,
+    update: UpdateUi,
+    /// Last check outcome, shown in Settings ("up to date", "check failed…").
+    update_note: Option<String>,
+    upd_tx: std::sync::mpsc::Sender<update::Msg>,
+    upd_rx: std::sync::mpsc::Receiver<update::Msg>,
+}
+
+/// Update flow state: the banner shows Available/Installing/InstallFailed.
+enum UpdateUi {
+    Idle,
+    Checking,
+    Available(update::Release),
+    Installing,
+    InstallFailed(String),
 }
 
 /// Stable tile ids for per-tile GPU state: grid substream = index,
@@ -161,6 +176,12 @@ impl App {
             .callback_resources
             .insert(render::VideoRenderer::new(&rs.device, rs.target_format));
         let (tx, snap_rx) = std::sync::mpsc::channel();
+        let (upd_tx, upd_rx) = std::sync::mpsc::channel();
+        // Launch-time update check (Updater.checkInBackground): installed
+        // builds only — a source build shouldn't be nagged about releases.
+        if update::installed() {
+            update::check(upd_tx.clone(), cc.egui_ctx.clone());
+        }
         let mut app = App {
             cams: Vec::new(),
             focused: None,
@@ -171,6 +192,10 @@ impl App {
             last_key_sel: 0,
             snap_rx,
             instance_lock,
+            update: UpdateUi::Idle,
+            update_note: None,
+            upd_tx,
+            upd_rx,
         };
         match source {
             Source::Single(name, url) => {
@@ -592,6 +617,32 @@ impl App {
                     stream::SMOOTH.store(smooth, std::sync::atomic::Ordering::Relaxed);
                     self.prefs.save();
                 }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let checking = matches!(self.update, UpdateUi::Checking);
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("Check for updates"))
+                        .clicked()
+                    {
+                        if update::installed() {
+                            self.update_note = None;
+                            self.update = UpdateUi::Checking;
+                            update::check(self.upd_tx.clone(), ctx.clone());
+                        } else {
+                            // Updater.checkInteractive's dev-build message.
+                            self.update_note = Some(format!(
+                                "Source build (v{}) — pull and rebuild to update.",
+                                update::VERSION
+                            ));
+                        }
+                    }
+                    if checking {
+                        ui.small("checking…");
+                    }
+                });
+                if let Some(note) = &self.update_note {
+                    ui.small(note.clone());
+                }
             });
         self.settings_open = open;
         if decode_changed {
@@ -599,7 +650,76 @@ impl App {
             self.restart_streams(ctx);
         }
 
-        // Render change: confirm before relaunching; Cancel reverts.
+        self.show_pending_render(ctx);
+    }
+
+    /// Update flow banner, top center: offer -> installing -> failure.
+    fn show_update_banner(&mut self, ctx: &egui::Context) {
+        let mut install = false;
+        let mut dismiss = false;
+        let mut open_notes: Option<String> = None;
+        let win = |title_hint: &str| {
+            egui::Window::new(title_hint)
+                .id(egui::Id::new("update banner"))
+                .title_bar(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+        };
+        match &self.update {
+            UpdateUi::Available(rel) => {
+                let (tag, notes) = (rel.tag.clone(), rel.notes_url.clone());
+                win("update").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "HikYeah {tag} is available — you have v{}",
+                            update::VERSION
+                        ));
+                        if ui.button("Install").clicked() {
+                            install = true;
+                        }
+                        if !notes.is_empty() && ui.button("Notes").clicked() {
+                            open_notes = Some(notes);
+                        }
+                        if ui.button("Later").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            }
+            UpdateUi::Installing => {
+                win("update").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Updating — HikYeah restarts when the installer finishes…");
+                    });
+                });
+            }
+            UpdateUi::InstallFailed(e) => {
+                let e = e.clone();
+                win("update").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Update failed: {e}"));
+                        if ui.button("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            }
+            _ => {}
+        }
+        if let Some(url) = open_notes {
+            update::open_url(&url);
+        }
+        if install {
+            self.update = UpdateUi::Installing;
+            update::apply(self.upd_tx.clone(), ctx.clone());
+        } else if dismiss {
+            self.update = UpdateUi::Idle;
+        }
+    }
+
+    /// Render change: confirm before relaunching; Cancel reverts.
+    fn show_pending_render(&mut self, ctx: &egui::Context) {
         if let Some(pending) = self.pending_render.clone() {
             let name = pending.clone().unwrap_or_else(|| "Default".into());
             egui::Window::new("Restart required")
@@ -661,7 +781,12 @@ fn single_instance_lock() -> Option<std::fs::File> {
 /// lock so it's released before the successor checks it.
 fn relaunch(lock: Option<std::fs::File>) -> ! {
     drop(lock);
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(mut exe) = std::env::current_exe() {
+        // After a self-update the old binary is unlinked and /proc/self/exe
+        // reads "…/hikyeah (deleted)" — point back at the fresh file.
+        if let Some(orig) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            exe = orig.into();
+        }
         let _ = std::process::Command::new(exe)
             .args(std::env::args().skip(1))
             .spawn();
@@ -692,6 +817,22 @@ impl eframe::App for App {
             let tex = ctx.load_texture(format!("snap{idx}"), img, egui::TextureOptions::LINEAR);
             if let Some(cam) = self.cams.get_mut(idx) {
                 cam.placeholder = Some((tex, false));
+            }
+        }
+        while let Ok(msg) = self.upd_rx.try_recv() {
+            match msg {
+                update::Msg::Available(r) => self.update = UpdateUi::Available(r),
+                update::Msg::UpToDate(tag) => {
+                    self.update = UpdateUi::Idle;
+                    self.update_note = Some(format!("Up to date — {tag} is the latest release."));
+                }
+                update::Msg::CheckFailed(e) => {
+                    self.update = UpdateUi::Idle;
+                    self.update_note = Some(format!("Update check failed: {e}"));
+                }
+                // Onto the new binary + ffmpeg the installer just swapped in.
+                update::Msg::Installed => relaunch(self.instance_lock.take()),
+                update::Msg::InstallFailed(e) => self.update = UpdateUi::InstallFailed(e),
             }
         }
         if ui
@@ -733,6 +874,7 @@ impl eframe::App for App {
         } else {
             self.show_grid(ui, avail);
         }
+        self.show_update_banner(&ctx);
         if self.settings_open {
             self.show_settings(&ctx);
         }
