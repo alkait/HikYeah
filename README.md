@@ -21,6 +21,12 @@ entry:
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/install.sh)"
 ```
 
+To uninstall (asks before touching your camera config or prefs):
+
+```sh
+/bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/uninstall.sh)"
+```
+
 Prefer manual? Grab your platform's archive from
 [Releases](https://github.com/alkait/HikYeah/releases), extract, run —
 they're self-contained.

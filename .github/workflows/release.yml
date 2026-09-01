@@ -86,3 +86,4 @@ jobs:
           files: |
             hikyeah-*-${{ matrix.target }}.*
             ${{ runner.os == 'Linux' && 'install.sh' || '' }}
+            ${{ runner.os == 'Linux' && 'uninstall.sh' || '' }}
