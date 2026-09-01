@@ -10,6 +10,21 @@ during egui's render pass. Only the latest frame is ever shown, so latency
 can't accumulate; ffmpeg is respawned forever on exit or stall, like the Mac
 app. `HIK_SWDEC=1` forces software decode.
 
+## Install (Linux)
+
+One command installs (and later updates — just re-run it). It fetches the
+latest release, verifies its SHA-256, installs to `~/.local/share/hikyeah`
+(with a bundled ffmpeg), symlinks `~/.local/bin/hikyeah`, and adds a desktop
+entry:
+
+```sh
+/bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/install.sh)"
+```
+
+Prefer manual? Grab your platform's archive from
+[Releases](https://github.com/alkait/HikYeah/releases), extract, run —
+they're self-contained.
+
 ## Run
 
 ```sh
