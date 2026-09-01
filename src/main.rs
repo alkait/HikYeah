@@ -24,6 +24,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 fn main() -> eframe::Result {
+    // winit's Wayland path can burn a full core just presenting at 60 Hz
+    // (measured on Hyprland + NVIDIA: a blank window costs 98% of a core on
+    // Wayland vs 7% via Xwayland — same binary). Prefer X11 when available;
+    // HIK_WAYLAND=1 opts back in. Safe here: no threads exist yet.
+    if std::env::var_os("HIK_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some() {
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+    }
     let arg = std::env::args().nth(1);
     let source = match arg.as_deref() {
         Some("--test") => Source::Single("test pattern".into(), "--test".into()),
@@ -143,6 +150,10 @@ struct App {
     snap_rx: std::sync::mpsc::Receiver<(usize, egui::ColorImage)>,
     /// Held for our lifetime; handed to relaunch() so the successor can take it.
     instance_lock: Option<std::fs::File>,
+    /// HIK_DEBUG UI-loop stats: updates + time inside ui() per report window.
+    dbg_frames: u32,
+    dbg_spent: std::time::Duration,
+    dbg_win_start: Instant,
     update: UpdateUi,
     /// Last check outcome, shown in Settings ("up to date", "check failed…").
     update_note: Option<String>,
@@ -162,6 +173,12 @@ enum UpdateUi {
 /// Stable tile ids for per-tile GPU state: grid substream = index,
 /// focused main stream = index | MAIN_BIT.
 const MAIN_BIT: u64 = 1 << 32;
+
+/// Repaints are coalesced to ~60 Hz: a dozen cameras deliver 200+ frames/s
+/// combined, and repainting per frame burns a core drawing pixels the display
+/// never shows. Every wake asks for "a repaint within 16 ms" instead of "now",
+/// so one redraw presents everything that arrived in the window.
+const REPAINT_COALESCE: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl App {
     fn new(
@@ -192,6 +209,9 @@ impl App {
             last_key_sel: 0,
             snap_rx,
             instance_lock,
+            dbg_frames: 0,
+            dbg_spent: std::time::Duration::ZERO,
+            dbg_win_start: Instant::now(),
             update: UpdateUi::Idle,
             update_note: None,
             upd_tx,
@@ -265,7 +285,9 @@ impl App {
         let hw = self.prefs.hwaccel();
         for cam in &mut self.cams {
             let c = ctx.clone();
-            cam.shared = stream::start(cam.sub_url.clone(), hw, move || c.request_repaint());
+            cam.shared = stream::start(cam.sub_url.clone(), hw, move || {
+                c.request_repaint_after(REPAINT_COALESCE)
+            });
         }
     }
 
@@ -286,7 +308,9 @@ impl App {
             return;
         };
         let c = ctx.clone();
-        let main = stream::start(url, self.prefs.hwaccel(), move || c.request_repaint());
+        let main = stream::start(url, self.prefs.hwaccel(), move || {
+            c.request_repaint_after(REPAINT_COALESCE)
+        });
         self.focused = Some((idx, main));
         self.last_key_sel = idx; // arrows resume from here after unfocus
         self.key_sel = None;
@@ -808,6 +832,23 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // HIK_DEBUG: report the UI loop rate and the time spent inside this
+        // function — separates "repaint storm" from "cost outside our code".
+        let dbg_start = std::env::var_os("HIK_DEBUG").map(|_| Instant::now());
+        if let Some(now) = dbg_start {
+            self.dbg_frames += 1;
+            let win = now.duration_since(self.dbg_win_start);
+            if win.as_secs_f32() >= 2.0 {
+                eprintln!(
+                    "[ui] {:.0} updates/s, {:.2} ms inside ui() per update",
+                    self.dbg_frames as f32 / win.as_secs_f32(),
+                    self.dbg_spent.as_secs_f64() * 1000.0 / self.dbg_frames as f64,
+                );
+                self.dbg_frames = 0;
+                self.dbg_spent = std::time::Duration::ZERO;
+                self.dbg_win_start = now;
+            }
+        }
         // Close instantly: every ffmpeg dies on its broken stdout pipe the
         // moment we're gone (PDEATHSIG covers stalled ones on Linux), and
         // prefs are saved when changed — nothing needs a graceful path.
@@ -867,7 +908,9 @@ impl eframe::App for App {
             bump(main.advance(now));
         }
         if let Some(d) = next_due {
-            ctx.request_repaint_after(d.saturating_duration_since(now));
+            // Quantized to the coalescing window — a frame due in 2 ms must
+            // not re-trigger the per-frame redraw rate this exists to cap.
+            ctx.request_repaint_after(d.saturating_duration_since(now).max(REPAINT_COALESCE));
         }
 
         let avail = ui.max_rect();
@@ -880,6 +923,9 @@ impl eframe::App for App {
         self.show_update_banner(&ctx);
         if self.settings_open {
             self.show_settings(&ctx);
+        }
+        if let Some(start) = dbg_start {
+            self.dbg_spent += start.elapsed();
         }
     }
 }
