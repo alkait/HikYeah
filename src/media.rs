@@ -47,6 +47,25 @@ pub fn save_dir() -> PathBuf {
     if desktop.is_dir() { desktop } else { home }
 }
 
+/// Move a finished capture to the name the user typed (same folder, same
+/// extension); refuses to overwrite.
+pub fn rename(path: &std::path::Path, stem: &str) -> Result<PathBuf, String> {
+    let stem = stem.trim();
+    if stem.is_empty() || stem.contains('/') || stem.contains('\\') {
+        return Err("Enter a file name (no slashes)".into());
+    }
+    let ext = path.extension().map_or("", |e| e.to_str().unwrap_or(""));
+    let target = path.with_file_name(format!("{stem}.{ext}"));
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err("A file with that name already exists".into());
+    }
+    std::fs::rename(path, &target).map_err(|e| e.to_string())?;
+    Ok(target)
+}
+
 /// "Front Door 2026-07-20 14.32.05.jpg" (wall clock), never overwriting —
 /// collisions get " (2)"….
 pub fn unique_path(camera: &str, ext: &str) -> PathBuf {

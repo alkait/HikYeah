@@ -170,6 +170,8 @@ pub struct App {
     pub recorder: Option<media::Recorder>,
     /// Shutter flash for snapshots: when it started.
     pub flash_at: Option<Instant>,
+    /// Finished captures waiting to be named (front is on screen).
+    pub save_prompts: std::collections::VecDeque<overlay::SavePrompt>,
     media_tx: std::sync::mpsc::Sender<media::Msg>,
     media_rx: std::sync::mpsc::Receiver<media::Msg>,
     /// For background work that needs to wake the UI (recorder shutdown).
@@ -247,6 +249,7 @@ impl App {
             nerd: stats::NerdStats::default(),
             recorder: None,
             flash_at: None,
+            save_prompts: Default::default(),
             media_tx,
             media_rx,
             ctx: cc.egui_ctx.clone(),
@@ -466,12 +469,13 @@ impl App {
         }
     }
 
-    fn media_done(&mut self, result: Result<std::path::PathBuf, String>, what: &str) {
+    /// A capture landed on disk under its default name: offer to rename it
+    /// (the Mac app's save panel, minus the folder picker).
+    fn media_done(&mut self, result: Result<std::path::PathBuf, String>, what: &'static str) {
         match result {
-            Ok(path) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                self.flash(&format!("Saved {}", name.unwrap_or_default()));
-            }
+            Ok(path) => self
+                .save_prompts
+                .push_back(overlay::SavePrompt::new(path, what)),
             Err(e) => self.flash(&format!("{what} failed: {e}")),
         }
     }
@@ -479,7 +483,9 @@ impl App {
     /// Esc, in the Mac app's order: dialogs first, then reorder, cursor,
     /// zoom, and finally leaving the camera view.
     fn escape(&mut self) {
-        if self.settings.editor.is_some() {
+        if self.save_prompts.front().is_some() {
+            self.finish_save_prompt(false);
+        } else if self.settings.editor.is_some() {
             self.settings.editor = None;
         } else if self.settings.open {
             self.settings.open = false;
@@ -704,6 +710,7 @@ impl eframe::App for App {
             self.show_grid(ui, avail);
         }
         self.show_nerd_stats(&ctx);
+        self.show_save_prompt(&ctx);
         self.show_top_bar(&ctx);
         self.show_update_banner(&ctx);
         if self.settings.open {

@@ -3,9 +3,37 @@
 // (HelpOverlay.swift), a translucent panel listing the shortcuts for where
 // the user is right now.
 
-use crate::{App, tile};
+use crate::{App, media, tile};
 use eframe::egui;
+use std::path::PathBuf;
 use std::time::Instant;
+
+/// A finished snapshot or clip, on disk under its default name, waiting
+/// for the user to keep, rename or discard it.
+pub struct SavePrompt {
+    path: PathBuf,
+    what: &'static str,
+    /// The name being typed (no extension).
+    stem: String,
+    /// Select the whole name on the first frame so typing replaces it.
+    fresh: bool,
+    error: Option<String>,
+}
+
+impl SavePrompt {
+    pub fn new(path: PathBuf, what: &'static str) -> Self {
+        let stem = path
+            .file_stem()
+            .map_or(String::new(), |s| s.to_string_lossy().into_owned());
+        SavePrompt {
+            path,
+            what,
+            stem,
+            fresh: true,
+            error: None,
+        }
+    }
+}
 
 pub enum HelpContext {
     Grid,
@@ -110,6 +138,98 @@ pub fn show_help(ctx: &egui::Context, context: HelpContext) {
 }
 
 impl App {
+    /// The rename dialog for the front capture: Return saves under the typed
+    /// name, Esc (or Discard) deletes the file.
+    pub fn show_save_prompt(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.save_prompts.front_mut() else {
+            return;
+        };
+        let folder = p
+            .path
+            .parent()
+            .map_or(String::new(), |d| d.display().to_string());
+        let ext = p
+            .path
+            .extension()
+            .map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
+        let field_id = egui::Id::new("save prompt name");
+        let mut done: Option<bool> = None;
+        egui::Window::new(format!("Save {}", p.what.to_lowercase()))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut p.stem)
+                            .id(field_id)
+                            .desired_width(320.0),
+                    );
+                    ui.label(&ext);
+                    if p.fresh {
+                        p.fresh = false;
+                        resp.request_focus();
+                        let mut state =
+                            egui::text_edit::TextEditState::load(ctx, field_id).unwrap_or_default();
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(p.stem.chars().count()),
+                            )));
+                        state.store(ctx, field_id);
+                    }
+                });
+                ui.small(format!("in {folder}"));
+                if let Some(e) = &p.error {
+                    ui.colored_label(tile::CURSOR_RED, e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Save").clicked() {
+                            done = Some(true);
+                        }
+                        if ui.button("Discard").clicked() {
+                            done = Some(false);
+                        }
+                    });
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    done = Some(true);
+                }
+            });
+        if let Some(keep) = done {
+            self.finish_save_prompt(keep);
+        }
+    }
+
+    /// Save (rename to the typed name) or discard (delete) the front capture.
+    /// A rename that fails keeps the dialog up with the reason.
+    pub fn finish_save_prompt(&mut self, keep: bool) {
+        let Some(p) = self.save_prompts.front_mut() else {
+            return;
+        };
+        if keep {
+            match media::rename(&p.path, &p.stem) {
+                Ok(path) => {
+                    let name = path
+                        .file_name()
+                        .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                    self.save_prompts.pop_front();
+                    self.flash(&format!("Saved {name}"));
+                }
+                Err(e) => p.error = Some(e),
+            }
+        } else {
+            let _ = std::fs::remove_file(&p.path);
+            let what = p.what;
+            self.save_prompts.pop_front();
+            self.flash(&format!("{what} discarded"));
+        }
+    }
+
     /// Full-width bar parked above the window: slides down when the pointer
     /// touches the top edge, stays while the pointer is on it, and carries
     /// the Settings gear on the right.
