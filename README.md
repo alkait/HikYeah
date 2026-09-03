@@ -82,7 +82,8 @@ passwords in clear — treat it as a secret):
 pan. A `2.4× ✕` badge top-right shows the level — click it to reset — and
 `Esc` zooms out first before leaving the view.
 
-**Snapshots & clips** land on your Desktop (home if there is none) as
+**Snapshots & clips** land on your Desktop (home if there is none — or any
+folder you set under "Save captures to" in Settings) as
 `Camera 2026-07-20 14.32.05.jpg/.mp4`, and a dialog then lets you type over
 that name — `Return` keeps it, `Esc` or Discard deletes the capture. Nothing
 is ever overwritten. `S` fires a shutter flash the instant you press it. `R` records the

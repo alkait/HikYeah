@@ -433,10 +433,15 @@ impl App {
         let Some((idx, stored)) = self.focused_stored() else {
             return;
         };
+        let dir = match media::save_dir(&self.prefs) {
+            Ok(d) => d,
+            Err(e) => return self.flash(&e),
+        };
         self.flash_at = Some(Instant::now());
         media::spawn_snapshot(
             stored,
             self.cams[idx].name.clone(),
+            dir,
             self.media_tx.clone(),
             self.ctx.clone(),
         );
@@ -451,12 +456,17 @@ impl App {
         let Some((idx, stored)) = self.focused_stored() else {
             return;
         };
+        let dir = match media::save_dir(&self.prefs) {
+            Ok(d) => d,
+            Err(e) => return self.flash(&e),
+        };
         let cam = &self.cams[idx];
         match media::Recorder::start(
             &config::rtsp_url(&stored, config::MAIN_CHANNEL),
             stored.codec != "h264",
             &cam.name,
             cam.host.clone(),
+            &dir,
         ) {
             Ok(r) => self.recorder = Some(r),
             Err(e) => self.flash(&e),

@@ -19,8 +19,32 @@ pub enum Msg {
     Clip(Result<PathBuf, String>),
 }
 
+/// Where captures go: the folder chosen in Settings (created on demand),
+/// else the desktop.
+pub fn save_dir(prefs: &crate::prefs::Prefs) -> Result<PathBuf, String> {
+    let Some(custom) = prefs
+        .save_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(default_save_dir());
+    };
+    let dir = expand_home(custom);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't use {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// "~/Captures" → the home folder + "/Captures".
+pub fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some(rest) => crate::config::home_dir().join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(path),
+    }
+}
+
 /// The desktop (the XDG user dir on Linux), falling back to home.
-pub fn save_dir() -> PathBuf {
+pub fn default_save_dir() -> PathBuf {
     let home = crate::config::home_dir();
     #[cfg(target_os = "linux")]
     {
@@ -68,10 +92,9 @@ pub fn rename(path: &std::path::Path, stem: &str) -> Result<PathBuf, String> {
 
 /// "Front Door 2026-07-20 14.32.05.jpg" (wall clock), never overwriting —
 /// collisions get " (2)"….
-pub fn unique_path(camera: &str, ext: &str) -> PathBuf {
+pub fn unique_path(dir: &std::path::Path, camera: &str, ext: &str) -> PathBuf {
     let name = camera.replace('/', "-").replace(':', ".");
     let stamp = chrono::Local::now().format("%Y-%m-%d %H.%M.%S");
-    let dir = save_dir();
     let mut path = dir.join(format!("{name} {stamp}.{ext}"));
     let mut n = 2;
     while path.exists() {
@@ -82,7 +105,13 @@ pub fn unique_path(camera: &str, ext: &str) -> PathBuf {
 }
 
 /// Full-resolution JPEG of "now" from the camera itself, in the background.
-pub fn spawn_snapshot(cam: StoredCamera, name: String, tx: Sender<Msg>, ctx: egui::Context) {
+pub fn spawn_snapshot(
+    cam: StoredCamera,
+    name: String,
+    dir: PathBuf,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+) {
     std::thread::spawn(move || {
         let result = (|| {
             let path = format!(
@@ -94,7 +123,7 @@ pub fn spawn_snapshot(cam: StoredCamera, name: String, tx: Sender<Msg>, ctx: egu
             if jpeg.len() < 4 || jpeg[..2] != [0xFF, 0xD8] {
                 return Err("camera sent no picture".to_string());
             }
-            let out = unique_path(&name, "jpg");
+            let out = unique_path(&dir, &name, "jpg");
             std::fs::write(&out, &jpeg).map_err(|e| e.to_string())?;
             Ok(out)
         })();
@@ -115,8 +144,14 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(url: &str, hevc: bool, name: &str, host: String) -> Result<Recorder, String> {
-        let path = unique_path(name, "mp4");
+    pub fn start(
+        url: &str,
+        hevc: bool,
+        name: &str,
+        host: String,
+        dir: &std::path::Path,
+    ) -> Result<Recorder, String> {
+        let path = unique_path(dir, name, "mp4");
         let mut cmd = Command::new(crate::stream::ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
             .args(["-rtsp_transport", "tcp", "-i", url, "-an", "-c:v", "copy"]);

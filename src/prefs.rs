@@ -32,6 +32,9 @@ pub struct Prefs {
     /// Where the panel was last dragged to (window points).
     #[serde(default)]
     pub nerd_pos: Option<[f32; 2]>,
+    /// Folder for snapshots and clips; None = the desktop (media.rs).
+    #[serde(default)]
+    pub save_dir: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -48,6 +51,7 @@ impl Default for Prefs {
             remember_last_view: true,
             nerd_stats: false,
             nerd_pos: None,
+            save_dir: None,
         }
     }
 }

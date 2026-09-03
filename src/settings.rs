@@ -5,7 +5,7 @@
 // moment it's toggled.
 
 use crate::config::StoredCamera;
-use crate::{App, UpdateUi, config, isapi, prefs, relaunch, render, stream, tile, update};
+use crate::{App, UpdateUi, config, isapi, media, prefs, relaunch, render, stream, tile, update};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, channel};
 
@@ -183,6 +183,44 @@ impl App {
                 if changed {
                     self.prefs.save();
                 }
+                ui.separator();
+
+                // Capture folder: empty = the desktop; "~" is fine.
+                ui.horizontal(|ui| {
+                    ui.label("Save captures to");
+                    let mut dir = self.prefs.save_dir.clone().unwrap_or_default();
+                    let default = media::default_save_dir().display().to_string();
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut dir)
+                                .hint_text(&default)
+                                .desired_width(300.0),
+                        )
+                        .changed()
+                    {
+                        self.prefs.save_dir = Some(dir.clone()).filter(|d| !d.trim().is_empty());
+                        self.prefs.save();
+                    }
+                    if ui
+                        .add_enabled(self.prefs.save_dir.is_some(), egui::Button::new("Default"))
+                        .clicked()
+                    {
+                        self.prefs.save_dir = None;
+                        self.prefs.save();
+                    }
+                });
+                let note = match &self.prefs.save_dir {
+                    Some(d) => {
+                        let p = media::expand_home(d.trim());
+                        if p.is_dir() {
+                            format!("Snapshots and clips go to {}", p.display())
+                        } else {
+                            format!("{} will be created on first use", p.display())
+                        }
+                    }
+                    None => "Snapshots and clips go to the desktop (home if there is none).".into(),
+                };
+                ui.small(note);
                 ui.separator();
 
                 ui.horizontal(|ui| {
