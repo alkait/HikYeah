@@ -17,6 +17,15 @@ pub struct Prefs {
     /// Smooth live video (~0.2 s buffer absorbing delivery jitter).
     #[serde(default = "default_true")]
     pub smooth_live: bool,
+    /// Open full screen at launch (skipped while unconfigured, so the
+    /// first-run Settings window isn't buried).
+    #[serde(default = "default_true")]
+    pub start_fullscreen: bool,
+    /// Reopen where the user left off. Gates restoring only — state is
+    /// always recorded, so switching it back on picks up the current
+    /// session, not a stale one.
+    #[serde(default = "default_true")]
+    pub remember_last_view: bool,
 }
 
 fn default_true() -> bool {
@@ -29,6 +38,8 @@ impl Default for Prefs {
             decode: String::new(),
             render_adapter: None,
             smooth_live: true,
+            start_fullscreen: true,
+            remember_last_view: true,
         }
     }
 }
@@ -165,12 +176,9 @@ pub fn start_probe() {
     });
 }
 
-/// One-second 320×240 H.264 clip for probing, cached in ~/.cache/hikviewer.
+/// One-second 320×240 H.264 clip for probing, cached next to the snapshots.
 fn probe_sample() -> Option<std::path::PathBuf> {
-    let dir = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?
-        .join("hikviewer");
+    let dir = crate::snapshot::cache_dir();
     let path = dir.join("probe.mp4");
     if path.exists() {
         return Some(path);

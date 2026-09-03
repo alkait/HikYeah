@@ -26,6 +26,10 @@ const SHADER: &str = r#"
 @group(0) @binding(1) var tex_y: texture_2d<f32>;
 @group(0) @binding(2) var tex_u: texture_2d<f32>;
 @group(0) @binding(3) var tex_v: texture_2d<f32>;
+// Texture sub-rectangle to show (min.xy, max.xy): the whole frame for a
+// grid tile, a crop when the focused view is zoomed in. egui clamps a
+// callback's viewport to the screen, so zoom can't be an oversized rect.
+@group(0) @binding(4) var<uniform> uv_rect: vec4<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -39,7 +43,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     var out: VsOut;
     let corner = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
     out.pos = vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);
-    out.uv = vec2<f32>(corner.x, 1.0 - corner.y);
+    out.uv = mix(uv_rect.xy, uv_rect.zw, vec2<f32>(corner.x, 1.0 - corner.y));
     return out;
 }
 
@@ -66,10 +70,25 @@ pub struct VideoRenderer {
     tiles: HashMap<u64, Tile>,
 }
 
-#[derive(Default)]
 struct Tile {
     planes: Option<Planes>,
     uploaded_seq: u64,
+    uv_buf: wgpu::Buffer,
+}
+
+impl Tile {
+    fn new(device: &wgpu::Device) -> Self {
+        Tile {
+            planes: None,
+            uploaded_seq: 0,
+            uv_buf: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("video uv"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        }
+    }
 }
 
 struct Planes {
@@ -107,6 +126,16 @@ impl VideoRenderer {
                 tex_entry(1),
                 tex_entry(2),
                 tex_entry(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -154,7 +183,7 @@ impl VideoRenderer {
     }
 
     fn ensure_planes(&mut self, id: u64, device: &wgpu::Device, w: usize, h: usize) {
-        let tile = self.tiles.entry(id).or_default();
+        let tile = self.tiles.entry(id).or_insert_with(|| Tile::new(device));
         if tile
             .planes
             .as_ref()
@@ -203,6 +232,10 @@ impl VideoRenderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&views[2]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: tile.uv_buf.as_entire_binding(),
                 },
             ],
         });
@@ -253,12 +286,31 @@ impl VideoRenderer {
         }
         tile.uploaded_seq = f.seq;
     }
+
+    fn set_uv(&self, id: u64, queue: &wgpu::Queue, uv: eframe::egui::Rect) {
+        if let Some(tile) = self.tiles.get(&id) {
+            let mut bytes = [0u8; 16];
+            for (i, v) in [uv.min.x, uv.min.y, uv.max.x, uv.max.y].iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+            queue.write_buffer(&tile.uv_buf, 0, &bytes);
+        }
+    }
 }
 
 /// Per-paint callback: upload the tile's newest frame in prepare, draw in paint.
 pub struct VideoCallback {
     pub id: u64,
     pub shared: Arc<stream::Shared>,
+    /// Frame sub-rectangle (0..1 texture coords) mapped onto the paint rect.
+    pub uv: eframe::egui::Rect,
+}
+
+impl VideoCallback {
+    pub const FULL: eframe::egui::Rect = eframe::egui::Rect::from_min_max(
+        eframe::egui::pos2(0.0, 0.0),
+        eframe::egui::pos2(1.0, 1.0),
+    );
 }
 
 impl egui_wgpu::CallbackTrait for VideoCallback {
@@ -274,6 +326,7 @@ impl egui_wgpu::CallbackTrait for VideoCallback {
         if let Some(f) = self.shared.current.lock().unwrap().as_ref() {
             r.upload(self.id, device, queue, f);
         }
+        r.set_uv(self.id, queue, self.uv);
         Vec::new()
     }
 

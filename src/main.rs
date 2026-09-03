@@ -1,22 +1,28 @@
 // main.rs — HikYeah: cross-platform HikViewer port (Rust + egui + wgpu).
 //
-// A grid of live substream tiles, one per configured camera (mirrors the
-// macOS app: grid on channel 102). Double-clicking a tile focuses it
-// full-window on the camera's main stream (101); Esc returns to the grid.
-// Ctrl-, opens Settings (decode device / render adapter — explicit toggles,
-// no auto-detection).
+// App state and the frame loop live here; the views are their own modules
+// (grid.rs, focused.rs, settings.rs, overlay.rs). A grid of live substream
+// tiles, one per configured camera (mirrors the macOS app: grid on channel
+// 102). Double-clicking a tile focuses it full-window on the camera's main
+// stream (101); Esc returns to the grid. Ctrl-, opens Settings.
 //
-//   hikyeah                cameras from ~/.config/hikviewer/config.json
-//                          (same JSON as the macOS app's File > Export)
-//   hikyeah <rtsp-url>     single explicit URL (no focus view)
+//   hikyeah                cameras from the config file (config.rs) — the
+//                          Settings window opens when there are none yet
+//   hikyeah <rtsp-url>     single explicit URL (no focus view, no editing)
 //   hikyeah --test         ffmpeg synthetic test pattern (no camera needed)
 
 mod config;
+mod focused;
+mod grid;
+mod isapi;
+mod overlay;
 mod prefs;
 mod render;
 mod session;
+mod settings;
 mod snapshot;
 mod stream;
+mod tile;
 mod update;
 
 use eframe::egui;
@@ -39,25 +45,13 @@ fn main() -> eframe::Result {
             eprintln!("usage: hikyeah [rtsp://… | --test]  (unrecognized: {other})");
             std::process::exit(2);
         }
-        None => {
-            let cams: Vec<config::StoredCamera> = config::load()
-                .map(|c| {
-                    c.cameras
-                        .into_iter()
-                        .filter(|c| !c.host.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if cams.is_empty() {
-                eprintln!(
-                    "no cameras: pass an rtsp:// URL or --test, or put a HikViewer\n\
-                     config.json (File > Export on the Mac app) at {}",
-                    config::config_path().display()
-                );
-                std::process::exit(2);
-            }
-            Source::Config(cams)
-        }
+        None => Source::Config(config::load().unwrap_or_default()),
+    };
+    // Skip auto-fullscreen when unconfigured: the Settings window that
+    // opens on first run would be buried behind it (AppDelegate.swift).
+    let configured = match &source {
+        Source::Single(..) => true,
+        Source::Config(cfg) => !cfg.cameras.is_empty(),
     };
 
     #[cfg(target_os = "linux")]
@@ -95,7 +89,9 @@ fn main() -> eframe::Result {
         });
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 810.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1440.0, 810.0])
+            .with_fullscreen(app_prefs.start_fullscreen && configured),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
                 eframe::egui_wgpu::WgpuSetupCreateNew {
@@ -117,52 +113,75 @@ fn main() -> eframe::Result {
 enum Source {
     /// Explicit URL or --test: one tile, no main-stream focus.
     Single(String, String),
-    Config(Vec<config::StoredCamera>),
+    Config(config::StoredConfig),
 }
 
 /// One camera in the grid: its running substream and how to reach the
 /// main stream when focused.
-struct Cam {
-    name: String,
+pub struct Cam {
+    pub name: String,
     /// Identifies the camera across launches and reorders (session state).
-    host: String,
-    sub_url: String,
-    main_url: Option<String>,
-    shared: Arc<stream::Shared>,
+    pub host: String,
+    /// Stable id for GPU tile state, snapshot deliveries and animations —
+    /// indices shift under reorders and Settings saves.
+    pub id: u64,
+    pub sub_url: String,
+    pub main_url: Option<String>,
+    pub shared: Arc<stream::Shared>,
     /// JPEG shown until the first live frame: last-known from disk
     /// (true = "cached", dimmed + badged) or a fresh ISAPI snapshot (false).
-    placeholder: Option<(egui::TextureHandle, bool)>,
+    pub placeholder: Option<(egui::TextureHandle, bool)>,
 }
 
-struct App {
-    cams: Vec<Cam>,
-    /// Focused camera (index) and its main stream.
-    focused: Option<(usize, Arc<stream::Shared>)>,
-    prefs: prefs::Prefs,
-    settings_open: bool,
-    /// Render adapter choice awaiting the restart/cancel confirmation.
-    pending_render: Option<Option<String>>,
+/// The full-window view: which camera, its main stream, and digital zoom
+/// (scale 1–8 and the video point, 0..1, sitting at the view center).
+pub struct Focused {
+    pub idx: usize,
+    pub main: Arc<stream::Shared>,
+    pub zoom: f32,
+    pub center: egui::Vec2,
+}
+
+pub struct App {
+    pub cams: Vec<Cam>,
+    /// The on-disk config the grid was built from; None in single-URL mode
+    /// (nothing to edit, no order to persist).
+    pub config: Option<config::StoredConfig>,
+    pub focused: Option<Focused>,
+    pub prefs: prefs::Prefs,
+    pub settings: settings::SettingsUi,
     /// Grid keyboard cursor (red border): tile index + when it fades.
-    key_sel: Option<(usize, Instant)>,
+    pub key_sel: Option<(usize, Instant)>,
     /// Arrows resume from here (last cursor position or last focused tile).
-    last_key_sel: usize,
+    pub last_key_sel: usize,
+    /// Long-press drag-to-reorder in progress.
+    pub drag: Option<grid::Drag>,
+    /// The current press moved too far to become a long press.
+    pub press_voided: bool,
+    /// Tiles glide to their slots until then (after a drop or cancel).
+    pub settle_until: Instant,
+    pub help_open: bool,
+    /// The auto-hiding top bar is out (pointer at the top edge or on it).
+    pub top_bar: bool,
+    /// Transient centered message and when it appeared (HUD.swift).
+    pub hud: Option<(String, Instant)>,
+    next_cam_id: u64,
     /// Fresh snapshots arriving from the background ISAPI fetches.
-    snap_rx: std::sync::mpsc::Receiver<(usize, egui::ColorImage)>,
+    snap_tx: std::sync::mpsc::Sender<(u64, egui::ColorImage)>,
+    snap_rx: std::sync::mpsc::Receiver<(u64, egui::ColorImage)>,
     /// Held for our lifetime; handed to relaunch() so the successor can take it.
-    instance_lock: Option<std::fs::File>,
+    pub instance_lock: Option<std::fs::File>,
     /// HIK_DEBUG UI-loop stats: updates + time inside ui() per report window.
     dbg_frames: u32,
     dbg_spent: std::time::Duration,
     dbg_win_start: Instant,
-    update: UpdateUi,
-    /// Last check outcome, shown in Settings ("up to date", "check failed…").
-    update_note: Option<String>,
-    upd_tx: std::sync::mpsc::Sender<update::Msg>,
+    pub update: UpdateUi,
+    pub upd_tx: std::sync::mpsc::Sender<update::Msg>,
     upd_rx: std::sync::mpsc::Receiver<update::Msg>,
 }
 
 /// Update flow state: the banner shows Available/Installing/InstallFailed.
-enum UpdateUi {
+pub enum UpdateUi {
     Idle,
     Checking,
     Available(update::Release),
@@ -170,15 +189,15 @@ enum UpdateUi {
     InstallFailed(String),
 }
 
-/// Stable tile ids for per-tile GPU state: grid substream = index,
-/// focused main stream = index | MAIN_BIT.
-const MAIN_BIT: u64 = 1 << 32;
+/// Stable tile ids for per-tile GPU state: grid substream = camera id,
+/// focused main stream = camera id | MAIN_BIT.
+pub const MAIN_BIT: u64 = 1 << 32;
 
 /// Repaints are coalesced to ~60 Hz: a dozen cameras deliver 200+ frames/s
 /// combined, and repainting per frame burns a core drawing pixels the display
 /// never shows. Every wake asks for "a repaint within 16 ms" instead of "now",
 /// so one redraw presents everything that arrived in the window.
-const REPAINT_COALESCE: std::time::Duration = std::time::Duration::from_millis(16);
+pub const REPAINT_COALESCE: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl App {
     fn new(
@@ -192,7 +211,7 @@ impl App {
             .write()
             .callback_resources
             .insert(render::VideoRenderer::new(&rs.device, rs.target_format));
-        let (tx, snap_rx) = std::sync::mpsc::channel();
+        let (snap_tx, snap_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         // Launch-time update check (Updater.checkInBackground): installed
         // builds only — a source build shouldn't be nagged about releases.
@@ -201,19 +220,26 @@ impl App {
         }
         let mut app = App {
             cams: Vec::new(),
+            config: None,
             focused: None,
             prefs: app_prefs,
-            settings_open: false,
-            pending_render: None,
+            settings: settings::SettingsUi::default(),
             key_sel: None,
             last_key_sel: 0,
+            drag: None,
+            press_voided: false,
+            settle_until: Instant::now(),
+            help_open: false,
+            top_bar: false,
+            hud: None,
+            next_cam_id: 0,
+            snap_tx,
             snap_rx,
             instance_lock,
             dbg_frames: 0,
             dbg_spent: std::time::Duration::ZERO,
             dbg_win_start: Instant::now(),
             update: UpdateUi::Idle,
-            update_note: None,
             upd_tx,
             upd_rx,
         };
@@ -222,54 +248,28 @@ impl App {
                 app.cams = vec![Cam {
                     name,
                     host: String::new(),
+                    id: app.next_cam_id(),
                     sub_url: url,
                     main_url: None,
                     shared: Default::default(),
                     placeholder: None,
                 }];
+                app.start_streams(&cc.egui_ctx);
             }
-            Source::Config(stored) => {
-                app.cams = stored
-                    .iter()
-                    .map(|c| Cam {
-                        name: if c.name.is_empty() {
-                            c.host.clone()
-                        } else {
-                            c.name.clone()
-                        },
-                        host: c.host.clone(),
-                        sub_url: config::rtsp_url(c, config::SUB_CHANNEL),
-                        main_url: Some(config::rtsp_url(c, config::MAIN_CHANNEL)),
-                        shared: Default::default(),
-                        placeholder: None,
-                    })
-                    .collect();
-                for (i, c) in stored.iter().enumerate() {
-                    // Instant: last-known cached frame (marked cached, possibly stale).
-                    if let Some(img) = snapshot::load_cached(&c.host) {
-                        let tex = cc.egui_ctx.load_texture(
-                            format!("snap{i}"),
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        app.cams[i].placeholder = Some((tex, true));
-                    }
-                    // Fresh: live snapshot replaces it and refreshes the cache.
-                    snapshot::spawn_fetch(
-                        c.clone(),
-                        i,
-                        config::SUB_CHANNEL,
-                        tx.clone(),
-                        cc.egui_ctx.clone(),
-                    );
+            Source::Config(cfg) => {
+                let configured = !cfg.cameras.is_empty();
+                app.config = Some(cfg);
+                app.rebuild(&cc.egui_ctx);
+                if !configured {
+                    app.open_settings();
                 }
             }
         }
-        app.start_streams(&cc.egui_ctx);
         // Reopen where the user left off (SessionStore port): a focused
         // camera comes straight back, snapshot/substream bridging the wait.
         let st = session::load();
-        if st.location == "camera"
+        if app.prefs.remember_last_view
+            && st.location == session::Location::Camera
             && let Some(idx) = st.camera_host.and_then(|h| {
                 app.cams
                     .iter()
@@ -279,6 +279,63 @@ impl App {
             app.focus(idx, &cc.egui_ctx);
         }
         app
+    }
+
+    fn next_cam_id(&mut self) -> u64 {
+        self.next_cam_id += 1;
+        self.next_cam_id
+    }
+
+    /// (Re)build the grid from `config`: stop everything running, then one
+    /// tile per stored camera with its cached frame and a fresh snapshot on
+    /// the way (AppDelegate.rebuildStreams). Programmatic — the remembered
+    /// view isn't rewritten; quitting later records the grid anyway.
+    pub fn rebuild(&mut self, ctx: &egui::Context) {
+        if let Some(f) = self.focused.take() {
+            f.main.stop();
+        }
+        for cam in &self.cams {
+            cam.shared.stop();
+        }
+        self.key_sel = None;
+        self.last_key_sel = 0;
+        self.drag = None;
+        let stored = self
+            .config
+            .as_ref()
+            .map(|c| c.cameras.clone())
+            .unwrap_or_default();
+        self.cams = Vec::with_capacity(stored.len());
+        for c in &stored {
+            let id = self.next_cam_id();
+            // Instant: last-known cached frame (marked cached, possibly stale).
+            let placeholder = snapshot::load_cached(&c.host).map(|img| {
+                let tex = ctx.load_texture(format!("snap{id}"), img, egui::TextureOptions::LINEAR);
+                (tex, true)
+            });
+            // Fresh: live snapshot replaces it and refreshes the cache.
+            snapshot::spawn_fetch(
+                c.clone(),
+                id,
+                config::SUB_CHANNEL,
+                self.snap_tx.clone(),
+                ctx.clone(),
+            );
+            self.cams.push(Cam {
+                name: if c.name.is_empty() {
+                    c.host.clone()
+                } else {
+                    c.name.clone()
+                },
+                host: c.host.clone(),
+                id,
+                sub_url: config::rtsp_url(c, config::SUB_CHANNEL),
+                main_url: Some(config::rtsp_url(c, config::MAIN_CHANNEL)),
+                shared: Default::default(),
+                placeholder,
+            });
+        }
+        self.start_streams(ctx);
     }
 
     fn start_streams(&mut self, ctx: &egui::Context) {
@@ -293,9 +350,9 @@ impl App {
 
     /// Decode setting changed: tear down and relaunch every stream
     /// (saving applies immediately, like the Mac app's Settings).
-    fn restart_streams(&mut self, ctx: &egui::Context) {
-        if let Some((_, main)) = self.focused.take() {
-            main.stop();
+    pub fn restart_streams(&mut self, ctx: &egui::Context) {
+        if let Some(f) = self.focused.take() {
+            f.main.stop();
         }
         for cam in &self.cams {
             cam.shared.stop();
@@ -303,7 +360,7 @@ impl App {
         self.start_streams(ctx);
     }
 
-    fn focus(&mut self, idx: usize, ctx: &egui::Context) {
+    pub fn focus(&mut self, idx: usize, ctx: &egui::Context) {
         let Some(url) = self.cams[idx].main_url.clone() else {
             return;
         };
@@ -311,464 +368,41 @@ impl App {
         let main = stream::start(url, self.prefs.hwaccel(), move || {
             c.request_repaint_after(REPAINT_COALESCE)
         });
-        self.focused = Some((idx, main));
+        self.focused = Some(Focused {
+            idx,
+            main,
+            zoom: 1.0,
+            center: egui::vec2(0.5, 0.5),
+        });
         self.last_key_sel = idx; // arrows resume from here after unfocus
         self.key_sel = None;
         if !self.cams[idx].host.is_empty() {
-            session::save("camera", Some(&self.cams[idx].host));
+            session::save(session::Location::Camera, Some(&self.cams[idx].host));
         }
     }
 
-    fn unfocus(&mut self) {
-        if let Some((_, main)) = self.focused.take() {
-            main.stop();
-            session::save("grid", None);
+    pub fn unfocus(&mut self) {
+        if let Some(f) = self.focused.take() {
+            f.main.stop();
+            session::save(session::Location::Grid, None);
         }
     }
 
-    /// Aspect-fit `dims` (or 16:9 if unknown) inside `cell`.
-    fn fit(cell: egui::Rect, dims: Option<egui::Vec2>) -> egui::Rect {
-        let ts = dims.unwrap_or(egui::vec2(16.0, 9.0));
-        let scale = (cell.width() / ts.x).min(cell.height() / ts.y);
-        egui::Rect::from_center_size(cell.center(), ts * scale)
-    }
-
-    fn frame_dims(shared: &stream::Shared) -> Option<egui::Vec2> {
-        shared
-            .current
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|f| egui::vec2(f.width as f32, f.height as f32))
-    }
-
-    /// White text on a translucent black pill — the Mac app's overlay style
-    /// (TileView label: white on 55% black; nerd stats: white / dim white).
-    fn label(
-        painter: &egui::Painter,
-        pos: egui::Pos2,
-        align: egui::Align2,
-        text: &str,
-        font: egui::FontId,
-        color: egui::Color32,
-    ) {
-        let galley = painter.layout(text.to_string(), font, color, f32::INFINITY);
-        let rect = align.anchor_size(pos, galley.size());
-        painter.rect_filled(
-            rect.expand2(egui::vec2(5.0, 3.0)),
-            3.0,
-            egui::Color32::from_black_alpha(140),
-        );
-        painter.galley(rect.min, galley, color);
-    }
-
-    /// Placeholder JPEG, aspect-fit in `cell`; a cached one is dimmed to 75%
-    /// and badged so it's never mistaken for live (TileView.setPlaceholder).
-    fn draw_placeholder(
-        painter: &egui::Painter,
-        cell: egui::Rect,
-        tex: &egui::TextureHandle,
-        cached: bool,
-    ) -> egui::Rect {
-        let rect = Self::fit(cell, Some(tex.size_vec2()));
-        let tint = if cached {
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 191)
+    /// Esc, in the Mac app's order: dialogs first, then reorder, cursor,
+    /// zoom, and finally leaving the camera view.
+    fn escape(&mut self) {
+        if self.settings.editor.is_some() {
+            self.settings.editor = None;
+        } else if self.settings.open {
+            self.settings.open = false;
+        } else if self.drag.is_some() {
+            self.cancel_drag();
+        } else if self.key_sel.is_some() {
+            self.key_sel = None;
+        } else if self.focused.as_ref().is_some_and(Focused::zoomed) {
+            self.focused.as_mut().unwrap().reset_zoom();
         } else {
-            egui::Color32::WHITE
-        };
-        painter.image(
-            tex.id(),
-            rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            tint,
-        );
-        if cached {
-            Self::label(
-                painter,
-                rect.right_top() + egui::vec2(-6.0, 6.0),
-                egui::Align2::RIGHT_TOP,
-                "cached",
-                egui::FontId::proportional(10.0),
-                Self::WHITE,
-            );
-        }
-        rect
-    }
-
-    const WHITE: egui::Color32 = egui::Color32::from_rgba_premultiplied(240, 240, 240, 255);
-    const DIM: egui::Color32 = egui::Color32::from_rgba_premultiplied(150, 150, 150, 255);
-    /// NSColor.systemRed — the grid keyboard cursor.
-    const CURSOR_RED: egui::Color32 = egui::Color32::from_rgb(255, 59, 48);
-
-    fn show_focused(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
-        let Some((idx, main)) = &self.focused else {
-            return;
-        };
-        let (idx, main) = (*idx, main.clone());
-        let cam = &self.cams[idx];
-        let main_stats = main.stats.lock().unwrap().clone();
-
-        // Main stream once it has a frame on screen; the substream's picture
-        // as a stand-in while it connects (the Mac app's cached-frame trick),
-        // and the snapshot placeholder before even that.
-        let main_showing = main.current.lock().unwrap().is_some();
-        let (id, shared) = if main_showing {
-            (idx as u64 | MAIN_BIT, main.clone())
-        } else {
-            (idx as u64, self.cams[idx].shared.clone())
-        };
-        let dims = Self::frame_dims(&shared);
-        if dims.is_some() {
-            let rect = Self::fit(avail, dims);
-            ui.painter()
-                .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    render::VideoCallback { id, shared },
-                ));
-        } else if let Some((tex, cached)) = &cam.placeholder {
-            Self::draw_placeholder(ui.painter(), avail, tex, *cached);
-        }
-
-        Self::label(
-            ui.painter(),
-            avail.left_top() + egui::vec2(10.0, 8.0),
-            egui::Align2::LEFT_TOP,
-            &format!("{} — {}", cam.name, main_stats.status),
-            egui::FontId::proportional(12.0),
-            Self::WHITE,
-        );
-    }
-
-    /// One arrow press: show the cursor on the last-used tile, or move a
-    /// visible cursor by (dc, dr), clamped to the grid (GridView.swift port).
-    fn move_key_cursor(&mut self, dc: i32, dr: i32, cols: usize) {
-        let n = self.cams.len();
-        let mut i = self.last_key_sel.min(n - 1);
-        if let Some((cur, _)) = self.key_sel {
-            let rows = n.div_ceil(cols);
-            let c = ((cur % cols) as i32 + dc).clamp(0, cols as i32 - 1) as usize;
-            let r = ((cur / cols) as i32 + dr).clamp(0, rows as i32 - 1) as usize;
-            i = (r * cols + c).min(n - 1);
-        }
-        self.last_key_sel = i;
-        self.key_sel = Some((i, Instant::now() + std::time::Duration::from_secs(2)));
-    }
-
-    fn show_grid(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
-        let n = self.cams.len();
-        // Pick the column count that gives the largest 16:9 tiles.
-        let mut cols = 1;
-        let mut best = 0.0f32;
-        for c in 1..=n {
-            let rows = n.div_ceil(c);
-            let (cw, ch) = (avail.width() / c as f32, avail.height() / rows as f32);
-            let scale = (cw / 16.0).min(ch / 9.0);
-            if scale > best {
-                best = scale;
-                cols = c;
-            }
-        }
-        let rows = n.div_ceil(cols);
-        let (cw, ch) = (avail.width() / cols as f32, avail.height() / rows as f32);
-
-        // Keyboard navigation: arrows drive the red cursor, Return focuses it,
-        // 5 s of inactivity clears it.
-        let mut focus: Option<usize> = None;
-        if !self.settings_open {
-            ui.input(|i| {
-                if i.key_pressed(egui::Key::ArrowLeft) {
-                    self.move_key_cursor(-1, 0, cols);
-                }
-                if i.key_pressed(egui::Key::ArrowRight) {
-                    self.move_key_cursor(1, 0, cols);
-                }
-                if i.key_pressed(egui::Key::ArrowUp) {
-                    self.move_key_cursor(0, -1, cols);
-                }
-                if i.key_pressed(egui::Key::ArrowDown) {
-                    self.move_key_cursor(0, 1, cols);
-                }
-            });
-            if ui.input(|i| i.key_pressed(egui::Key::Enter))
-                && let Some((i, _)) = self.key_sel
-            {
-                focus = Some(i);
-            }
-        }
-        if let Some((_, deadline)) = self.key_sel {
-            let now = Instant::now();
-            if now >= deadline {
-                self.key_sel = None;
-            } else {
-                ui.ctx().request_repaint_after(deadline - now);
-            }
-        }
-
-        for (i, cam) in self.cams.iter().enumerate() {
-            let cell = egui::Rect::from_min_size(
-                avail.left_top() + egui::vec2((i % cols) as f32 * cw, (i / cols) as f32 * ch),
-                egui::vec2(cw, ch),
-            )
-            .shrink(1.0);
-            let dims = Self::frame_dims(&cam.shared);
-            let rect = match (dims, &cam.placeholder) {
-                (Some(d), _) => {
-                    let rect = Self::fit(cell, Some(d));
-                    ui.painter()
-                        .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                            rect,
-                            render::VideoCallback {
-                                id: i as u64,
-                                shared: cam.shared.clone(),
-                            },
-                        ));
-                    rect
-                }
-                (None, Some((tex, cached))) => {
-                    Self::draw_placeholder(ui.painter(), cell, tex, *cached)
-                }
-                (None, None) => Self::fit(cell, None),
-            };
-
-            let status = cam.shared.stats.lock().unwrap().status.clone();
-            Self::label(
-                ui.painter(),
-                rect.left_bottom() + egui::vec2(6.0, -6.0),
-                egui::Align2::LEFT_BOTTOM,
-                &format!("{} — {}", cam.name, status),
-                egui::FontId::proportional(12.0),
-                Self::WHITE,
-            );
-
-            if self.key_sel.is_some_and(|(sel, _)| sel == i) {
-                ui.painter().rect_stroke(
-                    rect.shrink(1.5),
-                    0.0,
-                    egui::Stroke::new(3.0, Self::CURSOR_RED),
-                    egui::StrokeKind::Inside,
-                );
-            }
-
-            if cam.main_url.is_some() {
-                let resp = ui.interact(cell, egui::Id::new("tile").with(i), egui::Sense::click());
-                if resp.double_clicked() {
-                    focus = Some(i);
-                }
-            }
-        }
-        if let Some(i) = focus {
-            let ctx = ui.ctx().clone();
-            self.focus(i, &ctx);
-        }
-
-        // Settings affordance: a quiet gear in the corner instead of a hint
-        // label — the tooltip carries the shortcut for discovery.
-        let gear = egui::Area::new(egui::Id::new("gear"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
-            .show(ui.ctx(), |ui| {
-                ui.add(
-                    egui::Button::new(egui::RichText::new("⚙").size(18.0).color(Self::DIM))
-                        .frame(false),
-                )
-                .on_hover_text("Settings — Ctrl-,")
-            });
-        if gear.inner.clicked() {
-            self.settings_open = true;
-        }
-    }
-
-    fn show_settings(&mut self, ctx: &egui::Context) {
-        let mut open = self.settings_open;
-        let mut decode_changed = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label("Decode");
-                let current = self.prefs.decode_label();
-                let mut options = prefs::available_decode_options();
-                // Keep the active choice visible even if the probe ruled it out.
-                if !options.iter().any(|o| o.label == current)
-                    && let Some(cur) = prefs::decode_options().iter().find(|o| o.label == current)
-                {
-                    options.push(cur);
-                }
-                egui::ComboBox::from_id_salt("decode")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for opt in options {
-                            let selected = self.prefs.decode_label() == opt.label;
-                            if ui.selectable_label(selected, opt.label).clicked() && !selected {
-                                self.prefs.decode = opt.id.to_string();
-                                decode_changed = true;
-                            }
-                        }
-                    });
-                ui.add_space(8.0);
-                ui.label("Render");
-                let adapters = render::adapter_names();
-                // Show the candidate while its restart prompt is up.
-                let shown: Option<String> = self
-                    .pending_render
-                    .clone()
-                    .unwrap_or_else(|| self.prefs.render_adapter.clone());
-                let shown_label = shown.clone().unwrap_or_else(|| "Default".into());
-                egui::ComboBox::from_id_salt("render")
-                    .selected_text(&shown_label)
-                    .show_ui(ui, |ui| {
-                        let mut pick = |val: Option<String>, label: &str, ui: &mut egui::Ui| {
-                            let selected = shown == val;
-                            if ui.selectable_label(selected, label).clicked()
-                                && val != self.prefs.render_adapter
-                            {
-                                self.pending_render = Some(val);
-                            }
-                        };
-                        pick(None, "Default", ui);
-                        for name in adapters {
-                            pick(Some(name.clone()), name, ui);
-                        }
-                    });
-                ui.small("Render changes take effect after restart.");
-                ui.add_space(8.0);
-                let mut smooth = self.prefs.smooth_live;
-                if ui
-                    .checkbox(
-                        &mut smooth,
-                        "Smooth live video (buffers ~0.2 s to absorb Wi-Fi jitter)",
-                    )
-                    .changed()
-                {
-                    self.prefs.smooth_live = smooth;
-                    stream::SMOOTH.store(smooth, std::sync::atomic::Ordering::Relaxed);
-                    self.prefs.save();
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let checking = matches!(self.update, UpdateUi::Checking);
-                    if ui
-                        .add_enabled(!checking, egui::Button::new("Check for updates"))
-                        .clicked()
-                    {
-                        if update::installed() {
-                            self.update_note = None;
-                            self.update = UpdateUi::Checking;
-                            update::check(self.upd_tx.clone(), ctx.clone());
-                        } else {
-                            // Updater.checkInteractive's dev-build message.
-                            self.update_note = Some(format!(
-                                "Source build (v{}) — pull and rebuild to update.",
-                                update::VERSION
-                            ));
-                        }
-                    }
-                    if checking {
-                        ui.small("checking…");
-                    }
-                });
-                if let Some(note) = &self.update_note {
-                    ui.small(note.clone());
-                }
-            });
-        self.settings_open = open;
-        if decode_changed {
-            self.prefs.save();
-            self.restart_streams(ctx);
-        }
-
-        self.show_pending_render(ctx);
-    }
-
-    /// Update flow banner, top center: offer -> installing -> failure.
-    fn show_update_banner(&mut self, ctx: &egui::Context) {
-        let mut install = false;
-        let mut dismiss = false;
-        let mut open_notes: Option<String> = None;
-        let win = |title_hint: &str| {
-            egui::Window::new(title_hint)
-                .id(egui::Id::new("update banner"))
-                .title_bar(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
-        };
-        match &self.update {
-            UpdateUi::Available(rel) => {
-                let (tag, notes) = (rel.tag.clone(), rel.notes_url.clone());
-                win("update").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "HikYeah {tag} is available — you have v{}",
-                            update::VERSION
-                        ));
-                        if ui.button("Install").clicked() {
-                            install = true;
-                        }
-                        if !notes.is_empty() && ui.button("Notes").clicked() {
-                            open_notes = Some(notes);
-                        }
-                        if ui.button("Later").clicked() {
-                            dismiss = true;
-                        }
-                    });
-                });
-            }
-            UpdateUi::Installing => {
-                win("update").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Updating — HikYeah restarts when the installer finishes…");
-                    });
-                });
-            }
-            UpdateUi::InstallFailed(e) => {
-                let e = e.clone();
-                win("update").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Update failed: {e}"));
-                        if ui.button("Dismiss").clicked() {
-                            dismiss = true;
-                        }
-                    });
-                });
-            }
-            _ => {}
-        }
-        if let Some(url) = open_notes {
-            update::open_url(&url);
-        }
-        if install {
-            self.update = UpdateUi::Installing;
-            update::apply(self.upd_tx.clone(), ctx.clone());
-        } else if dismiss {
-            self.update = UpdateUi::Idle;
-        }
-    }
-
-    /// Render change: confirm before relaunching; Cancel reverts.
-    fn show_pending_render(&mut self, ctx: &egui::Context) {
-        if let Some(pending) = self.pending_render.clone() {
-            let name = pending.clone().unwrap_or_else(|| "Default".into());
-            egui::Window::new("Restart required")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.label(format!("Switch rendering to \"{name}\"?"));
-                    ui.small("HikYeah restarts to apply the change.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Restart now").clicked() {
-                            self.prefs.render_adapter = pending.clone();
-                            self.prefs.save();
-                            self.pending_render = None;
-                            relaunch(self.instance_lock.take());
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.pending_render = None;
-                        }
-                    });
-                });
+            self.unfocus();
         }
     }
 }
@@ -806,7 +440,7 @@ fn single_instance_lock() -> Option<std::fs::File> {
 /// Spawn a fresh instance (same binary, same args) and exit this one on the
 /// spot — our ffmpeg children die on their broken pipes. Takes the instance
 /// lock so it's released before the successor checks it.
-fn relaunch(lock: Option<std::fs::File>) -> ! {
+pub fn relaunch(lock: Option<std::fs::File>) -> ! {
     drop(lock);
     if let Ok(mut exe) = std::env::current_exe() {
         // After a self-update the old binary is unlinked and /proc/self/exe
@@ -857,9 +491,9 @@ impl eframe::App for App {
         }
         let ctx = ui.ctx().clone();
         // Fresh ISAPI snapshots replace the cached placeholders, unbadged.
-        while let Ok((idx, img)) = self.snap_rx.try_recv() {
-            let tex = ctx.load_texture(format!("snap{idx}"), img, egui::TextureOptions::LINEAR);
-            if let Some(cam) = self.cams.get_mut(idx) {
+        while let Ok((id, img)) = self.snap_rx.try_recv() {
+            if let Some(cam) = self.cams.iter_mut().find(|c| c.id == id) {
+                let tex = ctx.load_texture(format!("snap{id}"), img, egui::TextureOptions::LINEAR);
                 cam.placeholder = Some((tex, false));
             }
         }
@@ -868,27 +502,58 @@ impl eframe::App for App {
                 update::Msg::Available(r) => self.update = UpdateUi::Available(r),
                 update::Msg::UpToDate(tag) => {
                     self.update = UpdateUi::Idle;
-                    self.update_note = Some(format!("Up to date — {tag} is the latest release."));
+                    self.settings.update_note =
+                        Some(format!("Up to date — {tag} is the latest release."));
                 }
                 update::Msg::CheckFailed(e) => {
                     self.update = UpdateUi::Idle;
-                    self.update_note = Some(format!("Update check failed: {e}"));
+                    self.settings.update_note = Some(format!("Update check failed: {e}"));
                 }
                 // Onto the new binary + ffmpeg the installer just swapped in.
                 update::Msg::Installed => relaunch(self.instance_lock.take()),
                 update::Msg::InstallFailed(e) => self.update = UpdateUi::InstallFailed(e),
             }
         }
-        if ui
-            .input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Comma))
+
+        // The help sheet swallows the key or click that closes it; text
+        // fields keep their keystrokes (a "?" in a password is a "?").
+        let typing = ctx.egui_wants_keyboard_input();
+        let help_was_open = self.help_open;
+        if help_was_open {
+            if ui.input(|i| {
+                i.pointer.any_pressed()
+                    || i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            }) {
+                self.help_open = false;
+            }
+        } else if !typing
+            && ui.input(|i| {
+                i.key_pressed(egui::Key::Questionmark)
+                    || i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Text(t) if t == "?"))
+            })
         {
-            self.settings_open = !self.settings_open;
+            self.help_open = true;
         }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.settings_open {
-                self.settings_open = false;
-            } else {
-                self.unfocus();
+        if !help_was_open {
+            if ui.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Comma)
+            }) {
+                if self.settings.open {
+                    self.settings.open = false;
+                } else {
+                    self.open_settings();
+                }
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::F11)) {
+                let fs = ui.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.escape();
             }
         }
 
@@ -904,8 +569,8 @@ impl eframe::App for App {
         for cam in &self.cams {
             bump(cam.shared.advance(now));
         }
-        if let Some((_, main)) = &self.focused {
-            bump(main.advance(now));
+        if let Some(f) = &self.focused {
+            bump(f.main.advance(now));
         }
         if let Some(d) = next_due {
             // Quantized to the coalescing window — a frame due in 2 ms must
@@ -920,10 +585,22 @@ impl eframe::App for App {
         } else {
             self.show_grid(ui, avail);
         }
+        self.show_top_bar(&ctx);
         self.show_update_banner(&ctx);
-        if self.settings_open {
+        if self.settings.open {
             self.show_settings(&ctx);
         }
+        if self.help_open {
+            overlay::show_help(
+                &ctx,
+                if self.focused.is_some() {
+                    overlay::HelpContext::Camera
+                } else {
+                    overlay::HelpContext::Grid
+                },
+            );
+        }
+        self.show_hud(&ctx);
         if let Some(start) = dbg_start {
             self.dbg_spent += start.elapsed();
         }

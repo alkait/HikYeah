@@ -6,11 +6,18 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Location {
+    #[default]
+    Grid,
+    Camera,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct SessionState {
-    /// "grid" or "camera".
     #[serde(default)]
-    pub location: String,
+    pub location: Location,
     #[serde(default)]
     pub camera_host: Option<String>,
 }
@@ -26,9 +33,9 @@ pub fn load() -> SessionState {
         .unwrap_or_default()
 }
 
-pub fn save(location: &str, camera_host: Option<&str>) {
+pub fn save(location: Location, camera_host: Option<&str>) {
     let state = SessionState {
-        location: location.to_string(),
+        location,
         camera_host: camera_host.map(str::to_string),
     };
     let p = path();

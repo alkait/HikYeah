@@ -6,7 +6,7 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 
 - Run `cargo fmt` and `cargo clippy` before every commit; keep the tree warning-free so new warnings stand out.
 - Minimal, clean, maintainable code. No speculative abstractions, no empty scaffolding — split modules only when a feature makes them grow.
-- Flat `src/`, one module per concern. Split `main.rs` (app state vs. grid/focused/settings UI) when the next feature lands, not before. Single crate; no workspace.
+- Flat `src/`, one module per concern: `main.rs` is app state + the frame loop; views live in `grid.rs`, `focused.rs`, `settings.rs`, `overlay.rs`. Single crate; no workspace.
 - Threads + channels + `Mutex` — no async runtime.
 - Prefer serde enums over stringly-typed state (e.g. session location, pref ids) when touching those files.
 - Don't add global statics; pass state through `Shared` or a settings struct.

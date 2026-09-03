@@ -1,8 +1,10 @@
 # HikYeah
 
 Cross-platform (Linux/Windows/macOS) port of
-[HikViewer](https://github.com/alkait/HikViewer) — currently a **walking
-skeleton**: one window, one live camera tile.
+[HikViewer](https://github.com/alkait/HikViewer): a live grid of your
+Hikvision cameras, any of them one double-click away from a full-window
+main-stream view with digital zoom. Recorded playback from the NVR is not
+ported yet.
 
 Pipeline: `ffmpeg` (RTSP → decode, NVDEC when available → yuv4mpegpipe on
 stdout) → I420 planes → three R8 wgpu textures → YUV→RGB in a WGSL shader
@@ -41,12 +43,49 @@ cargo build --release
 ```
 
 Uses the `ffmpeg` sitting next to the executable if there is one (release
-archives bundle a static build), else `ffmpeg` from PATH. With no arguments it
-reads
-`~/.config/hikviewer/config.json` — the same JSON the Mac app's
-File > Export produces, so an exported config can be dropped there unchanged.
+archives bundle a static build), else `ffmpeg` from PATH.
 
-## Next steps (per the porting plan)
+## First run
 
-- Camera grid, focus view, then the rest of the UI in dependency order
-- Port `NVRClient` / `PlaybackStream` / ISAPI from the Swift reference
+With no cameras configured the Settings window opens by itself: press **+**,
+enter the camera's host, username, password and RTSP port, and optionally
+let **Detect** read its name and codec from the camera. **Save** starts the
+grid. Mixed fleets with different credentials are fine.
+
+The config is one JSON file, the same format as the Mac app's File > Export,
+so a setup moves between machines as a plain file copy (it contains the
+passwords in clear — treat it as a secret):
+
+| OS | Path |
+|---|---|
+| Linux | `~/.config/hikviewer/config.json` |
+| macOS | `~/Library/Application Support/hikviewer/config.json` (shared with HikViewer) |
+| Windows | `%APPDATA%\hikviewer\config.json` |
+
+## Everyday use
+
+| Action | Effect |
+|---|---|
+| Double-click a tile | focus it full-window (switches to the camera's main stream) |
+| `Esc` | back to the grid |
+| Arrow keys | move a red selection cursor between tiles; `Return` focuses it |
+| Long-press + drag a tile | reorder the grid (order is saved); `Esc` cancels |
+| `?` | keyboard shortcut help |
+| `F11` | toggle full screen |
+| `Ctrl-,` | Settings |
+
+**Digital zoom** (focused view): mouse wheel or pinch zooms toward the pointer
+(1×–8×), double-click for a quick 2× at that spot (again to restore), drag to
+pan. A `2.4× ✕` badge top-right shows the level — click it to reset — and
+`Esc` zooms out first before leaving the view.
+
+**Settings** also holds "Always start in full screen", "Remember where I left
+off" (the grid or the camera you quit from), "Smooth live video" (~0.2 s
+buffer absorbing Wi-Fi jitter; untick for minimum latency), the decode device
+(CPU, NVDEC, Quick Sync, VAAPI, … — only those that pass a startup probe are
+listed) and the render adapter.
+
+## Not ported yet
+
+NVR playback (calendar, timeline, motion), bookmarks, intrusion review,
+supplementary panes, snapshots/clips and the nerd-stats panel.
