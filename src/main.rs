@@ -4,7 +4,9 @@
 // (grid.rs, focused.rs, settings.rs, overlay.rs). A grid of live substream
 // tiles, one per configured camera (mirrors the macOS app: grid on channel
 // 102). Double-clicking a tile focuses it full-window on the camera's main
-// stream (101); Esc returns to the grid. Ctrl-, opens Settings.
+// stream (101); Esc returns to the grid. S saves a snapshot and R records a
+// clip of the focused camera; I shows the nerd-stats panel; Ctrl-, opens
+// Settings.
 //
 //   hikyeah                cameras from the config file (config.rs) — the
 //                          Settings window opens when there are none yet
@@ -15,12 +17,14 @@ mod config;
 mod focused;
 mod grid;
 mod isapi;
+mod media;
 mod overlay;
 mod prefs;
 mod render;
 mod session;
 mod settings;
 mod snapshot;
+mod stats;
 mod stream;
 mod tile;
 mod update;
@@ -161,6 +165,15 @@ pub struct App {
     /// Tiles glide to their slots until then (after a drop or cancel).
     pub settle_until: Instant,
     pub help_open: bool,
+    pub nerd: stats::NerdStats,
+    /// In-flight clip recording (R); at most one, tied to its camera.
+    pub recorder: Option<media::Recorder>,
+    /// Shutter flash for snapshots: when it started.
+    pub flash_at: Option<Instant>,
+    media_tx: std::sync::mpsc::Sender<media::Msg>,
+    media_rx: std::sync::mpsc::Receiver<media::Msg>,
+    /// For background work that needs to wake the UI (recorder shutdown).
+    ctx: egui::Context,
     /// The auto-hiding top bar is out (pointer at the top edge or on it).
     pub top_bar: bool,
     /// Transient centered message and when it appeared (HUD.swift).
@@ -213,6 +226,7 @@ impl App {
             .insert(render::VideoRenderer::new(&rs.device, rs.target_format));
         let (snap_tx, snap_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
+        let (media_tx, media_rx) = std::sync::mpsc::channel();
         // Launch-time update check (Updater.checkInBackground): installed
         // builds only — a source build shouldn't be nagged about releases.
         if update::installed() {
@@ -230,6 +244,12 @@ impl App {
             press_voided: false,
             settle_until: Instant::now(),
             help_open: false,
+            nerd: stats::NerdStats::default(),
+            recorder: None,
+            flash_at: None,
+            media_tx,
+            media_rx,
+            ctx: cc.egui_ctx.clone(),
             top_bar: false,
             hud: None,
             next_cam_id: 0,
@@ -291,6 +311,7 @@ impl App {
     /// the way (AppDelegate.rebuildStreams). Programmatic — the remembered
     /// view isn't rewritten; quitting later records the grid anyway.
     pub fn rebuild(&mut self, ctx: &egui::Context) {
+        self.stop_recording();
         if let Some(f) = self.focused.take() {
             f.main.stop();
         }
@@ -351,6 +372,7 @@ impl App {
     /// Decode setting changed: tear down and relaunch every stream
     /// (saving applies immediately, like the Mac app's Settings).
     pub fn restart_streams(&mut self, ctx: &egui::Context) {
+        self.stop_recording();
         if let Some(f) = self.focused.take() {
             f.main.stop();
         }
@@ -383,8 +405,74 @@ impl App {
 
     pub fn unfocus(&mut self) {
         if let Some(f) = self.focused.take() {
+            self.stop_recording(); // a clip follows its camera, not the view
             f.main.stop();
             session::save(session::Location::Grid, None);
+        }
+    }
+
+    /// The focused camera's stored entry (credentials, codec), if any.
+    fn focused_stored(&self) -> Option<(usize, config::StoredCamera)> {
+        let f = self.focused.as_ref()?;
+        let cam = &self.cams[f.idx];
+        let stored = self
+            .config
+            .as_ref()?
+            .cameras
+            .iter()
+            .find(|c| c.host == cam.host)?;
+        Some((f.idx, stored.clone()))
+    }
+
+    /// S: full-resolution snapshot of the focused camera to the desktop.
+    /// The shutter flash marks the captured moment; the HUD names the file.
+    fn save_snapshot(&mut self) {
+        let Some((idx, stored)) = self.focused_stored() else {
+            return;
+        };
+        self.flash_at = Some(Instant::now());
+        media::spawn_snapshot(
+            stored,
+            self.cams[idx].name.clone(),
+            self.media_tx.clone(),
+            self.ctx.clone(),
+        );
+    }
+
+    /// R: start or stop recording the focused camera's main stream.
+    fn toggle_recording(&mut self) {
+        if self.recorder.is_some() {
+            self.stop_recording();
+            return;
+        }
+        let Some((idx, stored)) = self.focused_stored() else {
+            return;
+        };
+        let cam = &self.cams[idx];
+        match media::Recorder::start(
+            &config::rtsp_url(&stored, config::MAIN_CHANNEL),
+            stored.codec != "h264",
+            &cam.name,
+            cam.host.clone(),
+        ) {
+            Ok(r) => self.recorder = Some(r),
+            Err(e) => self.flash(&e),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(r) = self.recorder.take() {
+            r.stop(self.media_tx.clone(), self.ctx.clone());
+        }
+    }
+
+    fn media_done(&mut self, result: Result<std::path::PathBuf, String>, what: &str) {
+        match result {
+            Ok(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                self.flash(&format!("Saved {}", name.unwrap_or_default()));
+            }
+            Err(e) => self.flash(&format!("{what} failed: {e}")),
         }
     }
 
@@ -457,6 +545,9 @@ pub fn relaunch(lock: Option<std::fs::File>) -> ! {
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(r) = self.recorder.take() {
+            r.stop_and_wait();
+        }
         self.unfocus();
         for cam in &self.cams {
             cam.shared.stop(); // don't orphan ffmpeg
@@ -487,6 +578,10 @@ impl eframe::App for App {
         // moment we're gone (PDEATHSIG covers stalled ones on Linux), and
         // prefs are saved when changed — nothing needs a graceful path.
         if ui.input(|i| i.viewport().close_requested()) {
+            // Except a clip in progress: give ffmpeg a moment to finalize.
+            if let Some(r) = self.recorder.take() {
+                r.stop_and_wait();
+            }
             std::process::exit(0);
         }
         let ctx = ui.ctx().clone();
@@ -496,6 +591,17 @@ impl eframe::App for App {
                 let tex = ctx.load_texture(format!("snap{id}"), img, egui::TextureOptions::LINEAR);
                 cam.placeholder = Some((tex, false));
             }
+        }
+        while let Ok(msg) = self.media_rx.try_recv() {
+            match msg {
+                media::Msg::Snapshot(r) => self.media_done(r, "Snapshot"),
+                media::Msg::Clip(r) => self.media_done(r, "Recording"),
+            }
+        }
+        // ffmpeg died on its own mid-clip (stream error): report the file.
+        if let Some(result) = self.recorder.as_mut().and_then(media::Recorder::poll) {
+            self.recorder = None;
+            self.media_done(result, "Recording");
         }
         while let Ok(msg) = self.upd_rx.try_recv() {
             match msg {
@@ -555,6 +661,18 @@ impl eframe::App for App {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.escape();
             }
+            if !typing {
+                if ui.input(|i| i.key_pressed(egui::Key::S)) {
+                    self.save_snapshot();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::R)) {
+                    self.toggle_recording();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::I)) {
+                    self.prefs.nerd_stats = !self.prefs.nerd_stats;
+                    self.prefs.save();
+                }
+            }
         }
 
         // Promote every due frame to the screen and wake up exactly when the
@@ -585,6 +703,7 @@ impl eframe::App for App {
         } else {
             self.show_grid(ui, avail);
         }
+        self.show_nerd_stats(&ctx);
         self.show_top_bar(&ctx);
         self.show_update_banner(&ctx);
         if self.settings.open {

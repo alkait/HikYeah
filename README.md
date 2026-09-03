@@ -70,6 +70,9 @@ passwords in clear — treat it as a secret):
 | `Esc` | back to the grid |
 | Arrow keys | move a red selection cursor between tiles; `Return` focuses it |
 | Long-press + drag a tile | reorder the grid (order is saved); `Esc` cancels |
+| `S` | snapshot of the focused camera (full resolution, from the camera itself) |
+| `R` | start / stop recording a clip of the focused camera |
+| `I` | nerd stats panel (focused camera, or the selected grid tile) |
 | `?` | keyboard shortcut help |
 | `F11` | toggle full screen |
 | `Ctrl-,` | Settings |
@@ -79,6 +82,22 @@ passwords in clear — treat it as a secret):
 pan. A `2.4× ✕` badge top-right shows the level — click it to reset — and
 `Esc` zooms out first before leaving the view.
 
+**Snapshots & clips** go straight to your Desktop (home if there is none)
+as `Camera 2026-07-20 14.32.05.jpg/.mp4`, never overwriting; the HUD names
+the file. `S` fires a shutter flash the instant you press it. `R` records the
+main stream with no re-encode (video only, fragmented MP4 so even a hard quit
+leaves a playable file); a red `● REC` badge counts up, and the clip also
+stops when you leave the camera.
+
+**Nerd stats** (`I`): a draggable panel of live diagnostics — stream and
+decode device, measured fps, arrival jitter (σ + worst gap), stalls and
+reconnects, the smoothing buffer's headroom, re-anchors and late frames,
+app + ffmpeg CPU, and Wi-Fi signal. Hover a row's name for what the number
+means; values turn amber/red past trouble thresholds; `⧉` copies a plain-text
+snapshot. A stream that goes silent for 12 s is killed and reconnected (that
+is a "stall"). Bitrate and GOP are not shown: ffmpeg hands the app decoded
+frames, so the compressed stream never passes through.
+
 **Settings** also holds "Always start in full screen", "Remember where I left
 off" (the grid or the camera you quit from), "Smooth live video" (~0.2 s
 buffer absorbing Wi-Fi jitter; untick for minimum latency), the decode device
@@ -87,5 +106,5 @@ listed) and the render adapter.
 
 ## Not ported yet
 
-NVR playback (calendar, timeline, motion), bookmarks, intrusion review,
-supplementary panes, snapshots/clips and the nerd-stats panel.
+NVR playback (calendar, timeline, motion), bookmarks, intrusion review and
+supplementary panes.

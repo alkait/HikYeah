@@ -139,6 +139,21 @@ impl App {
             tile::draw_placeholder(ui.painter(), avail, tex, *cached);
         }
 
+        // Camera-shutter flash for snapshots: 0.35 s fade from 70% white.
+        if let Some(at) = self.flash_at {
+            let t = at.elapsed().as_secs_f32() / 0.35;
+            if t < 1.0 {
+                ui.painter().rect_filled(
+                    avail,
+                    0.0,
+                    egui::Color32::from_white_alpha((178.0 * (1.0 - t)) as u8),
+                );
+                ui.ctx().request_repaint_after(crate::REPAINT_COALESCE);
+            } else {
+                self.flash_at = None;
+            }
+        }
+
         tile::label(
             ui.painter(),
             avail.left_top() + egui::vec2(10.0, 8.0),
@@ -148,24 +163,63 @@ impl App {
             tile::WHITE,
         );
 
-        if f.zoomed() {
-            let badge = egui::Area::new(egui::Id::new("zoom badge"))
+        // Top-right badges: REC with elapsed time, then the zoom level.
+        let rec = self
+            .recorder
+            .as_ref()
+            .map(|r| r.started.elapsed().as_secs());
+        if rec.is_some() || f.zoomed() {
+            let mut reset = false;
+            egui::Area::new(egui::Id::new("focused badges"))
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
                 .show(ui.ctx(), |ui| {
-                    ui.add(
-                        egui::Button::new(
-                            egui::RichText::new(format!(" {:.1}× ✕ ", f.zoom))
-                                .size(10.0)
-                                .strong()
-                                .color(tile::WHITE),
-                        )
-                        .fill(egui::Color32::from_black_alpha(140))
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(3.0),
-                    )
-                    .on_hover_text("Reset zoom — Esc")
+                    ui.horizontal(|ui| {
+                        if let Some(s) = rec {
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_black_alpha(140))
+                                .corner_radius(3.0)
+                                .inner_margin(egui::Margin::symmetric(5, 2))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(
+                                        egui::RichText::new("●").size(11.0).color(tile::CURSOR_RED),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "REC {}:{:02}",
+                                            s / 60,
+                                            s % 60
+                                        ))
+                                        .size(11.0)
+                                        .strong()
+                                        .monospace()
+                                        .color(tile::WHITE),
+                                    );
+                                });
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_secs(1));
+                        }
+                        if f.zoomed()
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!(" {:.1}× ✕ ", f.zoom))
+                                            .size(10.0)
+                                            .strong()
+                                            .color(tile::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_black_alpha(140))
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(3.0),
+                                )
+                                .on_hover_text("Reset zoom — Esc")
+                                .clicked()
+                        {
+                            reset = true;
+                        }
+                    });
                 });
-            if badge.inner.clicked() {
+            if reset {
                 f.reset_zoom();
             }
         }

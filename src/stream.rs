@@ -34,17 +34,45 @@ pub struct Frame {
     pub due: Instant,
 }
 
+/// One frame's arrival, for the nerd-stats jitter/buffer windows.
+#[derive(Clone, Copy)]
+pub struct Sample {
+    pub t: Instant,
+    /// Seconds since the previous frame (0 for the first).
+    pub gap: f32,
+    /// Scheduled headroom in seconds; negative = smoothing off.
+    pub lead: f32,
+}
+
+/// Frames scheduled with less headroom than this are "late" — near-misses
+/// that show up before re-anchors do.
+pub const LATE_LEAD: f32 = 0.03;
+
 #[derive(Default, Clone)]
 pub struct Stats {
     pub status: String,
     pub frames: u64,
     pub reconnects: u32,
+    pub last_reconnect: Option<Instant>,
+    /// Sessions that went silent and were killed by the watchdog.
+    pub stalls: u32,
     /// Times smoothing gave up and restarted its schedule — each is one
     /// brief visible hiccup.
     pub reanchors: u32,
+    pub late: u64,
     pub fps: f32,
     pub first_frame_secs: Option<f32>,
+    /// Last ~25 s of arrivals at 20 fps (oldest first).
+    pub samples: VecDeque<Sample>,
+    /// Last frame (or launch) — the stall watchdog's clock.
+    pub last_activity: Option<Instant>,
+    pub pid: Option<u32>,
 }
+
+const SAMPLE_CAP: usize = 512;
+/// A session silent this long is dead: kill ffmpeg and reconnect
+/// (CameraStream.swift's watchdog).
+const STALL_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Default)]
 pub struct Shared {
@@ -160,11 +188,37 @@ pub fn start(
             {
                 let mut st = sh.stats.lock().unwrap();
                 st.reconnects += 1;
+                st.last_reconnect = Some(Instant::now());
                 st.status = "reconnecting…".into();
                 st.fps = 0.0;
+                st.pid = None;
             }
             wake();
             std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+    // Stall watchdog: a TCP session can stay open while the camera stops
+    // sending, and the reader would block forever. Kill it; the supervisor
+    // reconnects.
+    let sh = shared.clone();
+    std::thread::spawn(move || {
+        while !sh.stopped.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(1));
+            let stalled = {
+                let mut st = sh.stats.lock().unwrap();
+                let stalled = st
+                    .last_activity
+                    .is_some_and(|t| t.elapsed() > STALL_TIMEOUT);
+                if stalled {
+                    st.stalls += 1;
+                    st.last_activity = None; // once per session
+                    st.status = "stalled — reconnecting…".into();
+                }
+                stalled
+            };
+            if stalled && let Some(c) = sh.child.lock().unwrap().as_mut() {
+                let _ = c.kill();
+            }
         }
     });
     shared
@@ -223,6 +277,11 @@ fn run_once(
         .spawn()
         .map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
     let mut out = child.stdout.take().unwrap();
+    {
+        let mut st = sh.stats.lock().unwrap();
+        st.pid = Some(child.id());
+        st.last_activity = Some(Instant::now());
+    }
     *sh.child.lock().unwrap() = Some(child);
 
     // y4m stream header, e.g. "YUV4MPEG2 W704 H576 F25:1 Ip A1:1 C420mpeg2\n".
@@ -281,6 +340,7 @@ fn run_once(
 
         let smoothing = SMOOTH.load(Ordering::Relaxed);
         let mut reanchored = false;
+        let mut lead = -1.0f32;
         let due = if smoothing {
             let mut t = if next_pts < 0.0 {
                 now + SMOOTHING_DELAY
@@ -294,6 +354,7 @@ fn run_once(
                 t = now + SMOOTHING_DELAY;
             }
             next_pts = t;
+            lead = (t - now) as f32;
             epoch + Duration::from_secs_f64(t)
         } else {
             next_pts = -1.0;
@@ -318,6 +379,19 @@ fn run_once(
             if reanchored {
                 st.reanchors += 1;
             }
+            if (0.0..LATE_LEAD).contains(&lead) {
+                st.late += 1;
+            }
+            let arrived = Instant::now();
+            st.last_activity = Some(arrived);
+            if st.samples.len() >= SAMPLE_CAP {
+                st.samples.pop_front();
+            }
+            st.samples.push_back(Sample {
+                t: arrived,
+                gap: gap as f32,
+                lead,
+            });
             let win = win_start.elapsed().as_secs_f32();
             if win >= 1.0 {
                 st.fps = win_frames as f32 / win;

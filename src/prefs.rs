@@ -26,6 +26,12 @@ pub struct Prefs {
     /// session, not a stale one.
     #[serde(default = "default_true")]
     pub remember_last_view: bool,
+    /// Nerd-stats panel visibility ("I" toggles it; survives relaunch).
+    #[serde(default)]
+    pub nerd_stats: bool,
+    /// Where the panel was last dragged to (window points).
+    #[serde(default)]
+    pub nerd_pos: Option<[f32; 2]>,
 }
 
 fn default_true() -> bool {
@@ -40,6 +46,8 @@ impl Default for Prefs {
             smooth_live: true,
             start_fullscreen: true,
             remember_last_view: true,
+            nerd_stats: false,
+            nerd_pos: None,
         }
     }
 }
