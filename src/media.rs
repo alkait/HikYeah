@@ -1,10 +1,9 @@
 // media.rs — snapshots (JPEG) and clips (MP4) of the focused camera, saved
-// straight to the desktop under the Mac app's naming (MediaSaver.swift).
-// No save panel here (that needs a file-dialog dependency): files get a
-// unique name and the HUD says where they went. Live snapshots come off the
-// camera's ISAPI picture endpoint at full resolution; clips are an ffmpeg
-// stream copy (no transcode) into fragmented MP4, so even a hard quit
-// leaves a playable file.
+// under the Mac app's naming (MediaSaver.swift) and then offered for
+// renaming. Live snapshots come off the camera's ISAPI picture endpoint at
+// full resolution; playback snapshots and all clips go through ffmpeg over
+// RTSP with stream copy (no transcode). Clips are fragmented MP4, so even a
+// hard quit leaves a playable file.
 
 use crate::config::StoredCamera;
 use eframe::egui;
@@ -90,11 +89,19 @@ pub fn rename(path: &std::path::Path, stem: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// "Front Door 2026-07-20 14.32.05.jpg" (wall clock), never overwriting —
-/// collisions get " (2)"….
-pub fn unique_path(dir: &std::path::Path, camera: &str, ext: &str) -> PathBuf {
+/// "2026-07-20 14.32.05" — the timestamp is footage time for playback (NVR
+/// timezone), wall clock for live (MediaSaver.defaultName).
+pub fn stamp<Tz: chrono::TimeZone>(t: chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    t.format("%Y-%m-%d %H.%M.%S").to_string()
+}
+
+/// "Front Door 2026-07-20 14.32.05.jpg", never overwriting — collisions get
+/// " (2)"….
+pub fn unique_path(dir: &std::path::Path, camera: &str, stamp: &str, ext: &str) -> PathBuf {
     let name = camera.replace('/', "-").replace(':', ".");
-    let stamp = chrono::Local::now().format("%Y-%m-%d %H.%M.%S");
     let mut path = dir.join(format!("{name} {stamp}.{ext}"));
     let mut n = 2;
     while path.exists() {
@@ -123,7 +130,7 @@ pub fn spawn_snapshot(
             if jpeg.len() < 4 || jpeg[..2] != [0xFF, 0xD8] {
                 return Err("camera sent no picture".to_string());
             }
-            let out = unique_path(&dir, &name, "jpg");
+            let out = unique_path(&dir, &name, &stamp(chrono::Local::now()), "jpg");
             std::fs::write(&out, &jpeg).map_err(|e| e.to_string())?;
             Ok(out)
         })();
@@ -132,58 +139,159 @@ pub fn spawn_snapshot(
     });
 }
 
+/// One decoded frame at the playback position, pulled from the NVR by
+/// ffmpeg's own RTSP client (MediaSaver.capturePlaybackSnapshot). Takes a
+/// few seconds — RTSP setup plus ffmpeg's initial buffering — so it works
+/// while paused: scrub to the moment and press S.
+pub fn spawn_playback_snapshot(
+    url: String,
+    name: String,
+    stamp: String,
+    dir: PathBuf,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let out = unique_path(&dir, &name, &stamp, "jpg");
+        let result = (|| {
+            let mut cmd = Command::new(crate::stream::ffmpeg_path());
+            cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+                .args(["-rtsp_transport", "tcp", "-i", &url])
+                .args(["-frames:v", "1", "-q:v", "2", "-f", "image2", "-y"])
+                .arg(&out)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            pdeathsig(&mut cmd);
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !matches!(child.try_wait(), Ok(Some(_))) {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) > 0 {
+                Ok(out.clone())
+            } else {
+                let _ = std::fs::remove_file(&out);
+                Err("the NVR sent no picture".to_string())
+            }
+        })();
+        let _ = tx.send(Msg::Snapshot(result));
+        ctx.request_repaint();
+    });
+}
+
+/// Belt-and-braces on Linux: the kernel kills ffmpeg the instant we die.
+fn pdeathsig(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
 /// One in-flight clip: an ffmpeg stream-copy mux independent of the viewing
-/// pipeline (ClipRecorder.swift). Records the main stream from the moment
-/// R is pressed.
+/// pipeline (ClipRecorder.swift), so pausing/seeking never disturbs the
+/// file. Input is either ffmpeg's own RTSP pull (live from the camera,
+/// playback from the NVR at 1×) or — for fast playback, where ffmpeg can't
+/// send the `Scale:` header — Annex B NALs pushed in through stdin from a
+/// native RTSP session, stamped by arrival time so the clip plays back at
+/// the watched speed.
 pub struct Recorder {
     child: Child,
     pub path: PathBuf,
     pub started: Instant,
     /// The camera it belongs to — leaving that camera stops the clip.
     pub host: String,
+    /// Piped mode: the session feeding stdin. Stopping it closes stdin —
+    /// EOF is the clean shutdown there.
+    feed: Option<crate::rtsp::Session>,
 }
 
 impl Recorder {
+    /// ffmpeg pulls `url` itself.
     pub fn start(
         url: &str,
         hevc: bool,
         name: &str,
+        stamp: &str,
         host: String,
         dir: &std::path::Path,
     ) -> Result<Recorder, String> {
-        let path = unique_path(dir, name, "mp4");
+        let path = unique_path(dir, name, stamp, "mp4");
         let mut cmd = Command::new(crate::stream::ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
             .args(["-rtsp_transport", "tcp", "-i", url, "-an", "-c:v", "copy"]);
+        let child = Self::spawn(cmd, hevc, &path, false)?;
+        Ok(Recorder {
+            child,
+            path,
+            started: Instant::now(),
+            host,
+            feed: None,
+        })
+    }
+
+    /// Piped mode (fast playback): raw elementary stream on stdin from a
+    /// native session at `scale`, wall-clock timestamps — the NVR paces
+    /// delivery at scale×, so arrival time IS the intended playback pace.
+    pub fn start_piped(
+        req: crate::rtsp::Request,
+        name: &str,
+        stamp: &str,
+        host: String,
+        dir: &std::path::Path,
+    ) -> Result<Recorder, String> {
+        let path = unique_path(dir, name, stamp, "mp4");
+        let hevc = req.codec == "hevc";
+        let mut cmd = Command::new(crate::stream::ffmpeg_path());
+        cmd.args(["-hide_banner", "-loglevel", "error"])
+            .args(["-use_wallclock_as_timestamps", "1"])
+            .args(["-f", req.codec, "-i", "pipe:0", "-an", "-c:v", "copy"]);
+        let mut child = Self::spawn(cmd, hevc, &path, true)?;
+        let stdin = child.stdin.take().unwrap();
+        let feed = crate::rtsp::start(req, stdin, |_| {});
+        Ok(Recorder {
+            child,
+            path,
+            started: Instant::now(),
+            host,
+            feed: Some(feed),
+        })
+    }
+
+    fn spawn(
+        mut cmd: Command,
+        hevc: bool,
+        path: &std::path::Path,
+        piped: bool,
+    ) -> Result<Child, String> {
         if hevc {
             cmd.args(["-tag:v", "hvc1"]); // QuickTime-openable HEVC
         }
         cmd.args(["-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "-y"])
-            .arg(&path)
-            .stdin(Stdio::null())
+            .arg(path)
+            .stdin(if piped { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::null())
             .stderr(if std::env::var_os("HIK_DEBUG").is_some() {
                 Stdio::inherit()
             } else {
                 Stdio::null()
             });
-        #[cfg(target_os = "linux")]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                Ok(())
-            });
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
-        Ok(Recorder {
-            child,
-            path,
-            started: Instant::now(),
-            host,
-        })
+        pdeathsig(&mut cmd);
+        cmd.spawn()
+            .map_err(|e| format!("ffmpeg failed to launch: {e}"))
     }
 
     /// ffmpeg exited on its own (stream error): the finished file, if any.
@@ -208,7 +316,13 @@ impl Recorder {
         self.wait_up_to(Duration::from_millis(1500));
     }
 
+    /// SIGINT lets ffmpeg finish the file cleanly. Piped mode instead
+    /// stops the feed — its closed stdin is the EOF ffmpeg finalizes on.
     fn interrupt(&mut self) {
+        if let Some(feed) = self.feed.take() {
+            feed.stop();
+            return;
+        }
         #[cfg(unix)]
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGINT);

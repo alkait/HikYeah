@@ -3,10 +3,13 @@
 // that resets). Zoom is a crop: the shader samples a sub-rectangle of the
 // frame, because egui clamps a paint callback's viewport to the screen.
 
-use crate::{App, Focused, MAIN_BIT, render, tile};
+use crate::{App, Focused, MAIN_BIT, render, tile, timeline};
 use eframe::egui;
 
 const MAX_ZOOM: f32 = 8.0;
+/// Tile id bit for the playback picture (one slot; the pipes behind it
+/// come and go with every seek).
+const PLAYBACK_BIT: u64 = 1 << 33;
 
 impl Focused {
     pub fn zoomed(&self) -> bool {
@@ -75,13 +78,25 @@ impl App {
             return;
         };
         let cam = &self.cams[f.idx];
-        let main_stats = f.main.stats.lock().unwrap().clone();
+        let status = match (&f.playback, &f.note) {
+            (Some(pb), _) => pb.status(),
+            (None, Some(n)) => n.clone(),
+            (None, None) => f.main.stats.lock().unwrap().status.clone(),
+        };
 
-        // Main stream once it has a frame on screen; the substream's picture
-        // as a stand-in while it connects (the Mac app's cached-frame trick),
-        // and the snapshot placeholder before even that.
-        let main_showing = f.main.current.lock().unwrap().is_some();
-        let (id, shared) = if main_showing {
+        // Playback's picture (the last frame stays up across seeks), else
+        // the main stream once it has a frame on screen; the substream's
+        // picture as a stand-in while either connects (the Mac app's
+        // cached-frame trick), and the snapshot placeholder before even that.
+        let playback_pic = f
+            .playback
+            .as_ref()
+            .map(|pb| pb.shown.clone())
+            .filter(|s| s.current.lock().unwrap().is_some());
+        let main_showing = f.playback.is_none() && f.main.current.lock().unwrap().is_some();
+        let (id, shared) = if let Some(s) = playback_pic {
+            (cam.id | PLAYBACK_BIT, s)
+        } else if main_showing {
             (cam.id | MAIN_BIT, f.main.clone())
         } else {
             (cam.id, cam.shared.clone())
@@ -91,12 +106,22 @@ impl App {
             egui::Id::new("focused"),
             egui::Sense::CLICK | egui::Sense::DRAG,
         );
+        // The playback bar owns the pointer over its strip.
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(avail.min.x, avail.max.y - timeline::BAR_HEIGHT),
+            avail.max,
+        );
+        let over_bar = f.playback.is_some() && resp.hover_pos().is_some_and(|p| bar.contains(p));
         if let Some(dims) = tile::frame_dims(&shared) {
             let base = tile::fit(avail, Some(dims));
             // Pinch (or Ctrl+wheel) and the plain wheel both zoom toward
             // the pointer (wheel up = in, like a map); a double-click
             // toggles a quick 2× at that spot.
-            let (pinch, wheel) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta().y));
+            let (pinch, wheel) = if over_bar {
+                (1.0, 0.0)
+            } else {
+                ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta().y))
+            };
             if pinch != 1.0 {
                 f.set_zoom(avail, base, f.zoom * pinch, resp.hover_pos());
             } else if wheel != 0.0 {
@@ -158,10 +183,17 @@ impl App {
             ui.painter(),
             avail.left_top() + egui::vec2(10.0, 8.0),
             egui::Align2::LEFT_TOP,
-            &format!("{} — {}", cam.name, main_stats.status),
+            &format!("{} — {}", cam.name, status),
             egui::FontId::proportional(12.0),
             tile::WHITE,
         );
+
+        if let Some(pb) = &mut f.playback
+            && pb.show_bar(ui, avail)
+        {
+            self.prefs.playback_speed = pb.speed;
+            self.prefs.save();
+        }
 
         // Top-right badges: REC with elapsed time, then the zoom level.
         let rec = self

@@ -6,7 +6,8 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 
 - Run `cargo fmt` and `cargo clippy` before every commit; keep the tree warning-free so new warnings stand out.
 - Minimal, clean, maintainable code. No speculative abstractions, no empty scaffolding — split modules only when a feature makes them grow.
-- Flat `src/`, one module per concern: `main.rs` is app state + the frame loop; views live in `grid.rs`, `focused.rs`, `settings.rs`, `overlay.rs`. Single crate; no workspace.
+- Flat `src/`, one module per concern: `main.rs` is app state + the frame loop; views live in `grid.rs`, `focused.rs`, `settings.rs`, `overlay.rs`, `timeline.rs` (playback bar); playback is `nvr.rs` (ISAPI) + `rtsp.rs` (native RTSP → ffmpeg stdin) + `playback.rs` (transport). Single crate; no workspace.
+- Port logic from the Mac sources as written — the quirks (fake-`Z` NVR-local timestamps, 2000-entry log cap, `searchResultPostion`, no-qop RTSP digest, pause = kill the pipe and keep the frame) are intentional, measured findings; don't re-derive or "fix" them.
 - Threads + channels + `Mutex` — no async runtime.
 - Prefer serde enums over stringly-typed state (e.g. session location, pref ids) when touching those files.
 - Don't add global statics; pass state through `Shared` or a settings struct.

@@ -3,8 +3,8 @@
 Cross-platform (Linux/Windows/macOS) port of
 [HikViewer](https://github.com/alkait/HikViewer): a live grid of your
 Hikvision cameras, any of them one double-click away from a full-window
-main-stream view with digital zoom. Recorded playback from the NVR is not
-ported yet.
+main-stream view with digital zoom, and recorded playback straight from
+your NVR with a calendar, a 24-hour timeline and up to 4× speed.
 
 Pipeline: `ffmpeg` (RTSP → decode, NVDEC when available → yuv4mpegpipe on
 stdout) → I420 planes → three R8 wgpu textures → YUV→RGB in a WGSL shader
@@ -50,7 +50,10 @@ archives bundle a static build), else `ffmpeg` from PATH.
 With no cameras configured the Settings window opens by itself: press **+**,
 enter the camera's host, username, password and RTSP port, and optionally
 let **Detect** read its name and codec from the camera. **Save** starts the
-grid. Mixed fleets with different credentials are fine.
+grid. Mixed fleets with different credentials are fine. Optionally fill the
+**NVR (for playback)** row — host, user, password — to enable recorded
+playback; see the Mac app's README for the least-privilege NVR account and
+the permissions it needs.
 
 The config is one JSON file, the same format as the Mac app's File > Export,
 so a setup moves between machines as a plain file copy (it contains the
@@ -70,8 +73,9 @@ passwords in clear — treat it as a secret):
 | `Esc` | back to the grid |
 | Arrow keys | move a red selection cursor between tiles; `Return` focuses it |
 | Long-press + drag a tile | reorder the grid (order is saved); `Esc` cancels |
-| `S` | snapshot of the focused camera (full resolution, from the camera itself) |
-| `R` | start / stop recording a clip of the focused camera |
+| `P` | recorded playback of the focused camera (from the NVR) |
+| `S` | snapshot of the focused camera (full resolution, from the camera itself; the frame at the playhead in playback) |
+| `R` | start / stop recording a clip of the focused camera (from the playhead in playback) |
 | `I` | nerd stats panel (focused camera, or the selected grid tile) |
 | `?` | keyboard shortcut help |
 | `F11` | toggle full screen |
@@ -91,6 +95,44 @@ main stream with no re-encode (video only, fragmented MP4 so even a hard quit
 leaves a playable file); a red `● REC` badge counts up, and the clip also
 stops when you leave the camera.
 
+### Playback (recorded footage from the NVR)
+
+On a **focused** camera press **`P`** — playback resumes from that camera's
+last position (a minute back the first time). A bar appears at the bottom:
+play/pause, the date (click for a **calendar** — days with recordings are
+teal), a 24-hour timeline with recorded ranges in teal, a zoom button and a
+speed button (1× → 2× → 4×, also the `X` key — one remembered choice shared
+by all cameras). Click the timeline to jump anywhere; the live substream
+keeps running underneath, so `Esc` back to live is instant.
+
+| Key | Effect |
+|---|---|
+| `Space` | pause / resume |
+| `←` / `→` | seek ±10 s (`Shift`: ±60 s, `Ctrl`: ±15 min) |
+| `0`–`9` | jump to that tenth of the footage in view (YouTube style) |
+| `X` | cycle speed 1× / 2× / 4× |
+| `C` | calendar (arrows move, `Return` picks a day) |
+| `T` | jump to today |
+| `S` / `R` | snapshot / record clip at this position |
+| `P` or `Esc` | back to live |
+
+- **Timeline zoom:** the zoom button cycles 24h → 6h → 1h → 10m, or
+  scroll/pinch on the strip; horizontal scroll pans, and the window follows
+  the playhead while playing.
+- Playback pauses when it reaches the live edge or a gap with nothing after
+  it. No per-camera setup is needed: the app asks the NVR which channel each
+  camera is plugged into and matches it to your camera list; a camera the NVR
+  doesn't record shows "not recorded on this NVR".
+- Playback speaks RTSP to the NVR itself (digest auth, interleaved TCP, the
+  `Scale` header for fast playback) and pipes the elementary stream into
+  ffmpeg for decoding: a seek is on screen in about half a second, where
+  ffmpeg's own RTSP client sits on the NVR's initial burst for ~4 s. Clips
+  at 2×/4× go through the same native session, so they play back at the
+  watched speed.
+- Every ISAPI/RTSP timestamp from the NVR is its **local time** with a fake
+  `Z`; the app reads the NVR's UTC offset from `/ISAPI/System/time` and
+  formats everything in that zone.
+
 **Nerd stats** (`I`): a draggable panel of live diagnostics — stream and
 decode device, measured fps, arrival jitter (σ + worst gap), stalls and
 reconnects, the smoothing buffer's headroom, re-anchors and late frames,
@@ -101,12 +143,14 @@ is a "stall"). Bitrate and GOP are not shown: ffmpeg hands the app decoded
 frames, so the compressed stream never passes through.
 
 **Settings** also holds "Always start in full screen", "Remember where I left
-off" (the grid or the camera you quit from), "Smooth live video" (~0.2 s
+off" (the grid or the camera you quit from — in playback, at that position;
+`state.json` next to the config uses the Mac app's format so both share it
+on macOS), "Smooth live video" (~0.2 s
 buffer absorbing Wi-Fi jitter; untick for minimum latency), the decode device
 (CPU, NVDEC, Quick Sync, VAAPI, … — only those that pass a startup probe are
 listed) and the render adapter.
 
 ## Not ported yet
 
-NVR playback (calendar, timeline, motion), bookmarks, intrusion review and
+Motion/intrusion highlights on the timeline, bookmarks, intrusion review and
 supplementary panes.

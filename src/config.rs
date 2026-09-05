@@ -37,8 +37,8 @@ impl StoredCamera {
     }
 }
 
-/// NVR credentials (recordings live there). Playback isn't ported yet —
-/// preserved so a Mac export survives a round trip through the editor.
+/// The NVR that holds the recordings (playback only — live viewing stays
+/// direct-to-camera). ISAPI goes over HTTP on port 80; `port` is RTSP.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct StoredNvr {
     pub host: String,
@@ -46,6 +46,12 @@ pub struct StoredNvr {
     pub password: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+}
+
+impl StoredNvr {
+    pub fn rtsp_port(&self) -> u16 {
+        self.port.unwrap_or(554)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -118,7 +124,7 @@ pub fn save(cfg: &StoredConfig) -> std::io::Result<()> {
 
 /// Percent-encode everything outside RFC 3986 unreserved (matches the Swift
 /// urlEncode — credentials with @ : / etc. survive the URL).
-fn url_encode(s: &str) -> String {
+pub fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

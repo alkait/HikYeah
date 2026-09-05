@@ -84,6 +84,10 @@ pub struct Shared {
     pool: Mutex<Vec<Vec<u8>>>,
     pub stats: Mutex<Stats>,
     stopped: AtomicBool,
+    /// A one-shot (pipe-fed) stream's ffmpeg exited: the footage ran out,
+    /// the feed failed, or it was stopped. Never set for live streams,
+    /// which reconnect instead.
+    ended: AtomicBool,
     child: Mutex<Option<Child>>,
 }
 
@@ -96,7 +100,11 @@ impl Shared {
         }
     }
 
-    fn set_status(&self, s: &str) {
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+
+    pub fn set_status(&self, s: &str) {
         self.stats.lock().unwrap().status = s.to_string();
     }
 
@@ -161,6 +169,17 @@ pub fn ffmpeg_path() -> std::path::PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
+/// What ffmpeg reads.
+pub enum Input {
+    /// ffmpeg's own RTSP client (live cameras).
+    Rtsp(String),
+    /// Synthetic test pattern (dev/demo).
+    Test,
+    /// Annex B elementary stream ("hevc" / "h264") pushed into ffmpeg's
+    /// stdin by the caller — the native RTSP playback client (rtsp.rs).
+    Pipe(&'static str),
+}
+
 /// Spawn the supervisor thread: launch ffmpeg, pump frames, relaunch on exit.
 /// `hwaccel` is the user's decode choice (ffmpeg -hwaccel value; None = CPU).
 /// `wake` is called after each published frame (UI repaint).
@@ -172,9 +191,14 @@ pub fn start(
     let shared = Arc::new(Shared::default());
     let sh = shared.clone();
     std::thread::spawn(move || {
+        let input = if url == "--test" {
+            Input::Test
+        } else {
+            Input::Rtsp(url)
+        };
         while !sh.stopped.load(Ordering::SeqCst) {
             sh.set_status("connecting…");
-            match run_once(&sh, &url, hwaccel, &wake) {
+            match run_once(&sh, &input, hwaccel, &wake) {
                 Ok(()) => {}
                 Err(e) => {
                     if std::env::var_os("HIK_DEBUG").is_some() {
@@ -224,33 +248,100 @@ pub fn start(
     shared
 }
 
+/// One ffmpeg fed on stdin, no supervisor: the caller writes the
+/// elementary stream into the returned handle and closes it to end the
+/// stream; `Shared::ended` reports when ffmpeg is gone. Never smoothed —
+/// the NVR paces playback (VideoStreamParser: "playback never smooths").
+pub fn start_pipe(
+    codec: &'static str,
+    hwaccel: Option<&'static str>,
+    wake: impl Fn() + Send + 'static,
+) -> Result<(Arc<Shared>, std::process::ChildStdin), String> {
+    let shared = Arc::new(Shared::default());
+    shared.set_status("connecting…");
+    let mut child = spawn_ffmpeg(&Input::Pipe(codec), hwaccel)?;
+    let stdin = child.stdin.take().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    {
+        let mut st = shared.stats.lock().unwrap();
+        st.pid = Some(child.id());
+        st.last_activity = Some(Instant::now());
+    }
+    *shared.child.lock().unwrap() = Some(child);
+    let sh = shared.clone();
+    std::thread::spawn(move || {
+        let launch = Instant::now();
+        if let Err(e) = pump(&sh, &mut out, false, launch, &wake)
+            && !sh.stopped.load(Ordering::SeqCst)
+            && std::env::var_os("HIK_DEBUG").is_some()
+        {
+            eprintln!("[playback] {e}");
+        }
+        sh.stats.lock().unwrap().pid = None;
+        sh.ended.store(true, Ordering::SeqCst);
+        wake();
+    });
+    Ok((shared, stdin))
+}
+
 /// One ffmpeg lifetime: spawn, parse the y4m header, stream frames until EOF.
 fn run_once(
     sh: &Shared,
-    url: &str,
+    input: &Input,
     hwaccel: Option<&'static str>,
     wake: &(impl Fn() + Send),
 ) -> Result<(), String> {
     let launch = Instant::now();
+    let mut child = spawn_ffmpeg(input, hwaccel)?;
+    let mut out = child.stdout.take().unwrap();
+    {
+        let mut st = sh.stats.lock().unwrap();
+        st.pid = Some(child.id());
+        st.last_activity = Some(Instant::now());
+    }
+    *sh.child.lock().unwrap() = Some(child);
+    pump(sh, &mut out, true, launch, wake)
+}
+
+fn spawn_ffmpeg(input: &Input, hwaccel: Option<&'static str>) -> Result<Child, String> {
     let mut cmd = Command::new(ffmpeg_path());
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if url == "--test" {
-        // Synthetic source: full pipeline minus the camera (dev/demo).
-        // -re paces lavfi at realtime, like a camera would.
-        cmd.args(["-re", "-f", "lavfi", "-i", "testsrc2=size=704x576:rate=25"]);
-    } else {
-        cmd.args([
-            "-rtsp_transport",
-            "tcp",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-        ]);
-        if let Some(hw) = hwaccel {
-            cmd.args(["-hwaccel", hw]);
+    match input {
+        Input::Test => {
+            // Synthetic source: full pipeline minus the camera (dev/demo).
+            // -re paces lavfi at realtime, like a camera would.
+            cmd.args(["-re", "-f", "lavfi", "-i", "testsrc2=size=704x576:rate=25"]);
         }
-        cmd.args(["-i", url]);
+        Input::Rtsp(url) => {
+            cmd.args([
+                "-rtsp_transport",
+                "tcp",
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+            ]);
+            if let Some(hw) = hwaccel {
+                cmd.args(["-hwaccel", hw]);
+            }
+            cmd.args(["-i", url]);
+        }
+        Input::Pipe(codec) => {
+            // No "-fflags nobuffer" here: on a raw elementary stream read
+            // from a pipe it makes the parser hand the decoder split NALs
+            // (measured: every frame errors, first picture lands a GOP late).
+            cmd.args(["-flags", "low_delay"]);
+            // Zero-probe fast start (CameraStream.swift): the parameter sets
+            // lead the stream, so skip ffmpeg's input analysis. HEVC only —
+            // the H.264 path needs the SPS dimensions before it commits.
+            if *codec == "hevc" {
+                cmd.args(["-probesize", "32", "-analyzeduration", "0"]);
+            }
+            if let Some(hw) = hwaccel {
+                cmd.args(["-hwaccel", hw]);
+            }
+            cmd.args(["-f", codec, "-i", "pipe:0"]);
+        }
     }
     cmd.args(["-an", "-f", "yuv4mpegpipe", "-pix_fmt", "yuv420p", "pipe:1"]);
     cmd.stdout(Stdio::piped());
@@ -259,7 +350,11 @@ fn run_once(
     } else {
         Stdio::null()
     });
-    cmd.stdin(Stdio::null());
+    cmd.stdin(if matches!(input, Input::Pipe(_)) {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
 
     // Belt-and-braces on Linux: the kernel kills ffmpeg the instant we die,
     // covering even a stalled one that never hits its broken stdout pipe.
@@ -273,19 +368,21 @@ fn run_once(
         });
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("ffmpeg failed to launch: {e}"))?;
-    let mut out = child.stdout.take().unwrap();
-    {
-        let mut st = sh.stats.lock().unwrap();
-        st.pid = Some(child.id());
-        st.last_activity = Some(Instant::now());
-    }
-    *sh.child.lock().unwrap() = Some(child);
+    cmd.spawn()
+        .map_err(|e| format!("ffmpeg failed to launch: {e}"))
+}
 
+/// Read the y4m header, then frames until EOF, publishing each. `live`
+/// streams smooth when the setting is on; pipe-fed playback never does.
+fn pump(
+    sh: &Shared,
+    out: &mut std::process::ChildStdout,
+    live: bool,
+    launch: Instant,
+    wake: &(impl Fn() + Send),
+) -> Result<(), String> {
     // y4m stream header, e.g. "YUV4MPEG2 W704 H576 F25:1 Ip A1:1 C420mpeg2\n".
-    let header = read_line(&mut out)?;
+    let header = read_line(out)?;
     let (mut w, mut h) = (0usize, 0usize);
     for tok in header.split_whitespace().skip(1) {
         match tok.as_bytes()[0] {
@@ -319,7 +416,7 @@ fn run_once(
         if sh.stopped.load(Ordering::SeqCst) {
             return Ok(());
         }
-        read_line(&mut out)?; // "FRAME" (+ optional params)
+        read_line(out)?; // "FRAME" (+ optional params)
         let mut yuv = sh.take_buffer(frame_len);
         out.read_exact(&mut yuv)
             .map_err(|e| format!("pipe closed: {e}"))?;
@@ -338,7 +435,7 @@ fn run_once(
         }
         last_arrival = now;
 
-        let smoothing = SMOOTH.load(Ordering::Relaxed);
+        let smoothing = live && SMOOTH.load(Ordering::Relaxed);
         let mut reanchored = false;
         let mut lead = -1.0f32;
         let due = if smoothing {

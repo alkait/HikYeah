@@ -72,7 +72,10 @@ pub struct VideoRenderer {
 
 struct Tile {
     planes: Option<Planes>,
-    uploaded_seq: u64,
+    /// What the textures hold: the source stream (by address — playback
+    /// swaps streams under one tile id, each restarting its sequence) and
+    /// the frame sequence number; 0 = nothing yet.
+    uploaded: (usize, u64),
     uv_buf: wgpu::Buffer,
 }
 
@@ -80,7 +83,7 @@ impl Tile {
     fn new(device: &wgpu::Device) -> Self {
         Tile {
             planes: None,
-            uploaded_seq: 0,
+            uploaded: (0, 0),
             uv_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("video uv"),
                 size: 16,
@@ -246,11 +249,22 @@ impl VideoRenderer {
             tex,
             bind,
         });
-        tile.uploaded_seq = 0;
+        tile.uploaded = (0, 0);
     }
 
-    fn upload(&mut self, id: u64, device: &wgpu::Device, queue: &wgpu::Queue, f: &stream::Frame) {
-        if self.tiles.get(&id).is_some_and(|t| t.uploaded_seq == f.seq) {
+    fn upload(
+        &mut self,
+        id: u64,
+        source: usize,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        f: &stream::Frame,
+    ) {
+        if self
+            .tiles
+            .get(&id)
+            .is_some_and(|t| t.uploaded == (source, f.seq))
+        {
             return;
         }
         self.ensure_planes(id, device, f.width, f.height);
@@ -284,7 +298,7 @@ impl VideoRenderer {
                 },
             );
         }
-        tile.uploaded_seq = f.seq;
+        tile.uploaded = (source, f.seq);
     }
 
     fn set_uv(&self, id: u64, queue: &wgpu::Queue, uv: eframe::egui::Rect) {
@@ -324,7 +338,13 @@ impl egui_wgpu::CallbackTrait for VideoCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let r: &mut VideoRenderer = resources.get_mut().expect("VideoRenderer registered");
         if let Some(f) = self.shared.current.lock().unwrap().as_ref() {
-            r.upload(self.id, device, queue, f);
+            r.upload(
+                self.id,
+                Arc::as_ptr(&self.shared) as usize,
+                device,
+                queue,
+                f,
+            );
         }
         r.set_uv(self.id, queue, self.uv);
         Vec::new()
@@ -338,7 +358,7 @@ impl egui_wgpu::CallbackTrait for VideoCallback {
     ) {
         let r: &VideoRenderer = resources.get().expect("VideoRenderer registered");
         if let Some(tile) = r.tiles.get(&self.id)
-            && let (Some(p), true) = (&tile.planes, tile.uploaded_seq > 0)
+            && let (Some(p), true) = (&tile.planes, tile.uploaded.1 > 0)
         {
             render_pass.set_pipeline(&r.pipeline);
             render_pass.set_bind_group(0, &p.bind, &[]);

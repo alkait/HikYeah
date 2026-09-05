@@ -35,6 +35,13 @@ pub struct Prefs {
     /// Folder for snapshots and clips; None = the desktop (media.rs).
     #[serde(default)]
     pub save_dir: Option<String>,
+    /// Playback speed (1/2/4×) — one preference shared across cameras.
+    #[serde(default = "default_speed")]
+    pub playback_speed: u32,
+}
+
+fn default_speed() -> u32 {
+    1
 }
 
 fn default_true() -> bool {
@@ -52,6 +59,7 @@ impl Default for Prefs {
             nerd_stats: false,
             nerd_pos: None,
             save_dir: None,
+            playback_speed: 1,
         }
     }
 }
@@ -247,10 +255,14 @@ impl Prefs {
     }
 
     pub fn load() -> Prefs {
-        std::fs::read(Self::path())
+        let mut p: Prefs = std::fs::read(Self::path())
             .ok()
             .and_then(|d| serde_json::from_slice(&d).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if ![1, 2, 4].contains(&p.playback_speed) {
+            p.playback_speed = 1;
+        }
+        p
     }
 
     pub fn save(&self) {

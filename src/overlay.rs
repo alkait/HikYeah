@@ -38,6 +38,7 @@ impl SavePrompt {
 pub enum HelpContext {
     Grid,
     Camera,
+    Playback,
 }
 
 impl HelpContext {
@@ -45,6 +46,7 @@ impl HelpContext {
         match self {
             HelpContext::Grid => "Grid",
             HelpContext::Camera => "Camera view",
+            HelpContext::Playback => "Playback",
         }
     }
 
@@ -61,6 +63,7 @@ impl HelpContext {
                 ("Esc", "cancel selection / reorder"),
             ],
             HelpContext::Camera => &[
+                ("P", "recorded playback"),
                 ("wheel / pinch", "zoom toward the pointer"),
                 ("2×click", "quick 2× there · again to reset"),
                 ("drag", "pan while zoomed"),
@@ -70,6 +73,19 @@ impl HelpContext {
                 ("F11", "full screen"),
                 ("Ctrl-,", "settings"),
                 ("Esc", "zoom out · back to the grid"),
+            ],
+            HelpContext::Playback => &[
+                ("Space", "pause / resume"),
+                ("← →", "seek 10 s · ⇧ 60 s · Ctrl 15 min"),
+                ("0–9", "jump within visible footage"),
+                ("X", "speed 1× → 2× → 4×"),
+                ("C", "calendar · arrows + ↵ pick a day"),
+                ("T", "jump to today"),
+                ("S", "snapshot at this position"),
+                ("R", "record clip from here"),
+                ("I", "nerd stats"),
+                ("scroll", "timeline zoom · pan"),
+                ("P / Esc", "back to live"),
             ],
         }
     }

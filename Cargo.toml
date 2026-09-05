@@ -11,6 +11,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 ureq = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+md-5 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

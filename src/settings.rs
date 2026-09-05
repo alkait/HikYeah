@@ -18,6 +18,9 @@ pub struct SettingsUi {
     pub staged: Vec<StoredCamera>,
     pub selected: Option<usize>,
     pub editor: Option<Editor>,
+    /// The NVR row as edited (host / user / password); committed by Save
+    /// with the cameras. An empty host means no NVR.
+    pub nvr: [String; 3],
     /// Last update-check outcome ("up to date", "check failed…").
     pub update_note: Option<String>,
 }
@@ -97,9 +100,41 @@ impl App {
             .as_ref()
             .map(|c| c.cameras.clone())
             .unwrap_or_default();
+        self.settings.nvr = self.staged_nvr_from_config();
         self.settings.selected = None;
         self.settings.editor = None;
         self.settings.open = true;
+    }
+
+    /// The NVR row as the config has it; a fresh row proposes "admin"
+    /// (SettingsWindowController.show).
+    fn staged_nvr_from_config(&self) -> [String; 3] {
+        match self.config.as_ref().and_then(|c| c.nvr.as_ref()) {
+            Some(n) => [n.host.clone(), n.user.clone(), n.password.clone()],
+            None => [String::new(), "admin".into(), String::new()],
+        }
+    }
+
+    /// What Save would store for the NVR: nothing when the host is empty; an
+    /// empty user falls back to "admin"; the RTSP port isn't in the UI, so a
+    /// hand-set value in the file is kept.
+    fn staged_nvr(&self) -> Option<config::StoredNvr> {
+        let [host, user, password] = &self.settings.nvr;
+        let host = host.trim();
+        if host.is_empty() {
+            return None;
+        }
+        let user = user.trim();
+        Some(config::StoredNvr {
+            host: host.to_string(),
+            user: if user.is_empty() { "admin" } else { user }.to_string(),
+            password: password.clone(),
+            port: self
+                .config
+                .as_ref()
+                .and_then(|c| c.nvr.as_ref())
+                .and_then(|n| n.port),
+        })
     }
 
     pub fn show_settings(&mut self, ctx: &egui::Context) {
@@ -137,16 +172,38 @@ impl App {
                                 None => self.flash("Select a camera first"),
                             }
                         }
-                        let dirty = self
-                            .config
-                            .as_ref()
-                            .is_some_and(|c| c.cameras != self.settings.staged);
-                        ui.add_space(12.0);
+                    });
+                    // NVR (recordings live there; playback-only, optional).
+                    ui.horizontal(|ui| {
+                        ui.label("NVR (for playback):");
+                        let [host, user, password] = &mut self.settings.nvr;
+                        ui.add(
+                            egui::TextEdit::singleline(host)
+                                .hint_text("host / IP")
+                                .desired_width(130.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(user)
+                                .hint_text("user")
+                                .desired_width(80.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(password)
+                                .hint_text("password")
+                                .password(true)
+                                .desired_width(130.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        let dirty = self.config.as_ref().is_some_and(|c| {
+                            c.cameras != self.settings.staged || c.nvr != self.staged_nvr()
+                        });
                         if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
                             save_cams = true;
                         }
                         if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
                             self.settings.staged = self.config.as_ref().unwrap().cameras.clone();
+                            self.settings.nvr = self.staged_nvr_from_config();
                             self.settings.selected = None;
                         }
                         if dirty {
@@ -361,16 +418,19 @@ impl App {
             });
     }
 
-    /// Commit the staged list: write the config and rebuild the grid.
+    /// Commit the staged cameras and NVR: write the config and rebuild the
+    /// grid (which also drops any NVR client, so new credentials apply).
     fn save_cameras(&mut self, ctx: &egui::Context) {
         if self.settings.staged.is_empty() {
             self.flash("Add at least one camera");
             return;
         }
+        let nvr = self.staged_nvr();
         let Some(cfg) = &mut self.config else {
             return;
         };
         cfg.cameras = self.settings.staged.clone();
+        cfg.nvr = nvr;
         match config::save(cfg) {
             Ok(()) => {
                 self.rebuild(ctx);

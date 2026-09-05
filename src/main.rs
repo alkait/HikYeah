@@ -18,15 +18,19 @@ mod focused;
 mod grid;
 mod isapi;
 mod media;
+mod nvr;
 mod overlay;
+mod playback;
 mod prefs;
 mod render;
+mod rtsp;
 mod session;
 mod settings;
 mod snapshot;
 mod stats;
 mod stream;
 mod tile;
+mod timeline;
 mod update;
 
 use eframe::egui;
@@ -144,6 +148,21 @@ pub struct Focused {
     pub main: Arc<stream::Shared>,
     pub zoom: f32,
     pub center: egui::Vec2,
+    /// Recorded-footage playback (P). Replaces the main stream while up;
+    /// the substream keeps running underneath so Esc back to live is
+    /// instant. Zoom survives the switch either way.
+    pub playback: Option<playback::Playback>,
+    /// Status shown instead of the stream's while entering playback
+    /// ("loading recordings…", "not recorded on this NVR").
+    pub note: Option<String>,
+}
+
+/// The NVR client, made lazily on the first playback and dropped on a
+/// Settings save so new credentials apply (AppDelegate.nvrClient).
+pub enum NvrState {
+    Idle,
+    Preparing(std::sync::mpsc::Receiver<Result<nvr::Client, String>>),
+    Ready(Arc<nvr::Client>),
 }
 
 pub struct App {
@@ -176,6 +195,9 @@ pub struct App {
     media_rx: std::sync::mpsc::Receiver<media::Msg>,
     /// For background work that needs to wake the UI (recorder shutdown).
     ctx: egui::Context,
+    pub nvr: NvrState,
+    /// A P press waiting on the NVR client: (camera index, start position).
+    pending_playback: Option<(usize, Option<chrono::DateTime<chrono::Utc>>)>,
     /// The auto-hiding top bar is out (pointer at the top edge or on it).
     pub top_bar: bool,
     /// Transient centered message and when it appeared (HUD.swift).
@@ -253,6 +275,8 @@ impl App {
             media_tx,
             media_rx,
             ctx: cc.egui_ctx.clone(),
+            nvr: NvrState::Idle,
+            pending_playback: None,
             top_bar: false,
             hud: None,
             next_cam_id: 0,
@@ -324,6 +348,8 @@ impl App {
         self.key_sel = None;
         self.last_key_sel = 0;
         self.drag = None;
+        self.nvr = NvrState::Idle; // pick up NVR credential changes lazily
+        self.pending_playback = None;
         let stored = self
             .config
             .as_ref()
@@ -398,19 +424,223 @@ impl App {
             main,
             zoom: 1.0,
             center: egui::vec2(0.5, 0.5),
+            playback: None,
+            note: None,
         });
         self.last_key_sel = idx; // arrows resume from here after unfocus
         self.key_sel = None;
-        if !self.cams[idx].host.is_empty() {
-            session::save(session::Location::Camera, Some(&self.cams[idx].host));
+        let host = self.cams[idx].host.clone();
+        if host.is_empty() {
+            return;
+        }
+        session::save(session::Location::Camera, Some(&host));
+        // A camera view just opened fresh: if it was left in playback, bring
+        // the position back (AppDelegate.restoreViewState).
+        if self.prefs.remember_last_view
+            && let Some(st) = session::load().per_camera.get(&host)
+            && st.mode == session::Mode::Playback
+        {
+            self.enter_playback(st.position());
         }
     }
 
     pub fn unfocus(&mut self) {
         if let Some(f) = self.focused.take() {
             self.stop_recording(); // a clip follows its camera, not the view
-            f.main.stop();
+            self.pending_playback = None;
+            // Remember the outgoing view (before its playback is torn down).
+            let host = self.cams[f.idx].host.clone();
+            let pos = f.playback.as_ref().map(playback::Playback::position);
+            drop(f); // stops the main stream and any playback pipe
+            self.save_view_state(&host, pos, pos.is_some());
             session::save(session::Location::Grid, None);
+        }
+    }
+
+    /// Record how `host`'s camera view looks right now. The last playback
+    /// position survives a return to live, so P can resume from it.
+    fn save_view_state(
+        &self,
+        host: &str,
+        position: Option<chrono::DateTime<chrono::Utc>>,
+        in_playback: bool,
+    ) {
+        if host.is_empty() {
+            return;
+        }
+        session::update(|s| {
+            let entry = s.per_camera.entry(host.to_string()).or_default();
+            entry.mode = if in_playback {
+                session::Mode::Playback
+            } else {
+                session::Mode::Live
+            };
+            if let Some(p) = position {
+                entry.playback_position = Some(session::to_apple(p));
+            }
+        });
+    }
+
+    /// P on a focused camera: playback resumes from the camera's remembered
+    /// position (not "a minute ago") when that's on.
+    fn playback_key(&mut self) {
+        let Some(f) = &self.focused else {
+            return;
+        };
+        if f.playback.is_some() {
+            self.exit_playback();
+            return;
+        }
+        let host = &self.cams[f.idx].host;
+        let start = if self.prefs.remember_last_view {
+            session::load()
+                .per_camera
+                .get(host)
+                .and_then(session::CameraViewState::position)
+        } else {
+            None
+        };
+        self.enter_playback(start);
+    }
+
+    /// Kick off playback on the focused camera: needs an NVR in Settings and
+    /// a ready client (prepared on a thread; `poll_nvr` finishes the job).
+    fn enter_playback(&mut self, start_at: Option<chrono::DateTime<chrono::Utc>>) {
+        let Some(f) = &mut self.focused else {
+            return;
+        };
+        if f.playback.is_some() {
+            return;
+        }
+        let idx = f.idx;
+        let Some(nvr) = self.config.as_ref().and_then(|c| c.nvr.clone()) else {
+            f.note = Some("no NVR in Settings (Ctrl-,)".into());
+            return;
+        };
+        f.note = Some("loading recordings…".into());
+        self.pending_playback = Some((idx, start_at));
+        match &self.nvr {
+            NvrState::Ready(_) => self.poll_nvr(),
+            NvrState::Preparing(_) => {}
+            NvrState::Idle => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = self.ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(nvr::Client::prepare(nvr));
+                    ctx.request_repaint();
+                });
+                self.nvr = NvrState::Preparing(rx);
+            }
+        }
+    }
+
+    /// The NVR client landed (or was already there): start the pending
+    /// playback if the same camera is still focused.
+    fn poll_nvr(&mut self) {
+        if let NvrState::Preparing(rx) = &self.nvr
+            && let Ok(result) = rx.try_recv()
+        {
+            match result {
+                Ok(c) => self.nvr = NvrState::Ready(Arc::new(c)),
+                Err(e) => {
+                    self.nvr = NvrState::Idle;
+                    self.pending_playback = None;
+                    if let Some(f) = &mut self.focused {
+                        f.note = Some(e);
+                    }
+                    return;
+                }
+            }
+        }
+        let (NvrState::Ready(client), Some((idx, start_at))) = (&self.nvr, self.pending_playback)
+        else {
+            return;
+        };
+        let Some(f) = &mut self.focused else {
+            self.pending_playback = None;
+            return;
+        };
+        if f.idx != idx || f.playback.is_some() {
+            self.pending_playback = None;
+            return;
+        }
+        self.pending_playback = None;
+        let cam = &self.cams[idx];
+        let Some(&ch) = client.channel_by_host.get(&cam.host) else {
+            f.note = Some("not recorded on this NVR".into());
+            return;
+        };
+        let codec: &'static str = match self
+            .config
+            .as_ref()
+            .and_then(|c| c.cameras.iter().find(|c| c.host == cam.host))
+        {
+            Some(c) if c.codec == "h264" => "h264",
+            _ => "hevc",
+        };
+        // Playback replaces the main-stream pipe; the substream keeps
+        // running underneath, so Esc back to live is instant. The main
+        // stream's last frame stays up until playback's first arrives.
+        f.main.stop();
+        f.note = None;
+        let mut pb = playback::Playback::new(
+            client.clone(),
+            nvr::track(ch),
+            codec,
+            self.prefs.hwaccel(),
+            self.ctx.clone(),
+            f.main.clone(),
+            self.prefs.playback_speed,
+        );
+        // Default: a minute back.
+        pb.begin(start_at.unwrap_or_else(|| chrono::Utc::now() - chrono::TimeDelta::seconds(60)));
+        f.playback = Some(pb);
+    }
+
+    /// Back to live on the same camera: restart the main-stream pipe.
+    fn exit_playback(&mut self) {
+        let Some(f) = &mut self.focused else {
+            return;
+        };
+        let Some(pb) = f.playback.take() else {
+            return;
+        };
+        if std::env::var_os("HIK_DEBUG").is_some() {
+            eprintln!("[playback] exit");
+        }
+        let host = self.cams[f.idx].host.clone();
+        let pos = pb.position();
+        drop(pb);
+        f.note = None;
+        if let Some(url) = self.cams[f.idx].main_url.clone() {
+            let c = self.ctx.clone();
+            f.main = stream::start(url, self.prefs.hwaccel(), move || {
+                c.request_repaint_after(REPAINT_COALESCE)
+            });
+        }
+        self.save_view_state(&host, Some(pos), false);
+    }
+
+    /// Per-frame playback housekeeping: fetches, transport persistence, HUD.
+    fn poll_playback(&mut self) {
+        self.poll_nvr();
+        let Some(f) = &mut self.focused else {
+            return;
+        };
+        let host = self.cams[f.idx].host.clone();
+        let Some(pb) = &mut f.playback else {
+            return;
+        };
+        pb.poll();
+        let hud = pb.hud.take();
+        // Every play/seek/pause refreshes the remembered position (crash
+        // insurance; a clean quit records it exactly).
+        let transport = pb.transport.take();
+        if let Some(text) = hud {
+            self.flash(&text);
+        }
+        if let Some((pos, _)) = transport {
+            self.save_view_state(&host, Some(pos), true);
         }
     }
 
@@ -427,8 +657,10 @@ impl App {
         Some((f.idx, stored.clone()))
     }
 
-    /// S: full-resolution snapshot of the focused camera to the desktop.
-    /// The shutter flash marks the captured moment; the HUD names the file.
+    /// S: still of the focused camera — live grabs the camera's full-res
+    /// ISAPI picture; playback pulls one decoded frame at the current
+    /// position from the NVR (takes a few seconds). The shutter flash marks
+    /// the captured moment.
     fn save_snapshot(&mut self) {
         let Some((idx, stored)) = self.focused_stored() else {
             return;
@@ -438,16 +670,29 @@ impl App {
             Err(e) => return self.flash(&e),
         };
         self.flash_at = Some(Instant::now());
-        media::spawn_snapshot(
-            stored,
-            self.cams[idx].name.clone(),
-            dir,
-            self.media_tx.clone(),
-            self.ctx.clone(),
-        );
+        let name = self.cams[idx].name.clone();
+        if let Some(pb) = self.focused.as_ref().and_then(|f| f.playback.as_ref()) {
+            let pos = pb.position();
+            let (path, _) =
+                pb.client
+                    .playback_request(pb.track, pos, pos + chrono::TimeDelta::seconds(300));
+            media::spawn_playback_snapshot(
+                pb.client.rtsp_url(&path),
+                name,
+                media::stamp(pb.client.local(pos)),
+                dir,
+                self.media_tx.clone(),
+                self.ctx.clone(),
+            );
+            return;
+        }
+        media::spawn_snapshot(stored, name, dir, self.media_tx.clone(), self.ctx.clone());
     }
 
-    /// R: start or stop recording the focused camera's main stream.
+    /// R: toggle clip recording of the focused camera. Live records the
+    /// main stream; playback records from the current position at the
+    /// speed set when R was pressed (a 4× clip plays back 4× fast),
+    /// unaffected by pausing/seeking while it runs.
     fn toggle_recording(&mut self) {
         if self.recorder.is_some() {
             self.stop_recording();
@@ -461,13 +706,55 @@ impl App {
             Err(e) => return self.flash(&e),
         };
         let cam = &self.cams[idx];
-        match media::Recorder::start(
-            &config::rtsp_url(&stored, config::MAIN_CHANNEL),
-            stored.codec != "h264",
-            &cam.name,
-            cam.host.clone(),
-            &dir,
-        ) {
+        let hevc = stored.codec != "h264";
+        let result = match self.focused.as_ref().and_then(|f| f.playback.as_ref()) {
+            Some(pb) => {
+                let pos = pb.position();
+                let (path, start_clock) =
+                    pb.client
+                        .playback_request(pb.track, pos, pos + chrono::TimeDelta::hours(6));
+                let stamp = media::stamp(pb.client.local(pos));
+                if pb.speed > 1 {
+                    // ffmpeg can't send the RTSP Scale: header, so fast
+                    // playback records through a native session piping NALs
+                    // into ffmpeg.
+                    media::Recorder::start_piped(
+                        rtsp::Request {
+                            host: pb.client.nvr.host.clone(),
+                            port: pb.client.nvr.rtsp_port(),
+                            user: pb.client.nvr.user.clone(),
+                            password: pb.client.nvr.password.clone(),
+                            path,
+                            start_clock,
+                            scale: pb.speed,
+                            codec: if hevc { "hevc" } else { "h264" },
+                        },
+                        &cam.name,
+                        &stamp,
+                        cam.host.clone(),
+                        &dir,
+                    )
+                } else {
+                    media::Recorder::start(
+                        &pb.client.rtsp_url(&path),
+                        hevc,
+                        &cam.name,
+                        &stamp,
+                        cam.host.clone(),
+                        &dir,
+                    )
+                }
+            }
+            None => media::Recorder::start(
+                &config::rtsp_url(&stored, config::MAIN_CHANNEL),
+                hevc,
+                &cam.name,
+                &media::stamp(chrono::Local::now()),
+                cam.host.clone(),
+                &dir,
+            ),
+        };
+        match result {
             Ok(r) => self.recorder = Some(r),
             Err(e) => self.flash(&e),
         }
@@ -505,8 +792,96 @@ impl App {
             self.key_sel = None;
         } else if self.focused.as_ref().is_some_and(Focused::zoomed) {
             self.focused.as_mut().unwrap().reset_zoom();
+        } else if let Some(pb) = self.focused.as_mut().and_then(|f| f.playback.as_mut()) {
+            // Leave playback (stay focused); an open calendar closes first.
+            if pb.cal.open {
+                pb.cal.open = false;
+            } else {
+                self.exit_playback();
+            }
         } else {
             self.unfocus();
+        }
+    }
+}
+
+impl App {
+    /// Playback shortcuts (AppDelegate.handleKey's playback block). The
+    /// calendar, while open, owns the arrows and Return.
+    fn playback_keys(&mut self, ui: &egui::Ui) {
+        let Some(pb) = self.focused.as_mut().and_then(|f| f.playback.as_mut()) else {
+            return;
+        };
+        let mut speed_changed = false;
+        ui.input(|i| {
+            use egui::Key;
+            if pb.cal.open {
+                if i.key_pressed(Key::ArrowLeft) {
+                    pb.move_calendar_cursor(-1);
+                }
+                if i.key_pressed(Key::ArrowRight) {
+                    pb.move_calendar_cursor(1);
+                }
+                if i.key_pressed(Key::ArrowUp) {
+                    pb.move_calendar_cursor(-7);
+                }
+                if i.key_pressed(Key::ArrowDown) {
+                    pb.move_calendar_cursor(7);
+                }
+                if i.key_pressed(Key::Enter) {
+                    pb.calendar_return();
+                }
+            } else {
+                // Arrow-key seek size: 10 s, Shift = 60 s, Ctrl = 15 min.
+                let skip = if i.modifiers.command || i.modifiers.ctrl {
+                    900
+                } else if i.modifiers.shift {
+                    60
+                } else {
+                    10
+                };
+                if i.key_pressed(Key::ArrowLeft) {
+                    pb.step(-skip);
+                }
+                if i.key_pressed(Key::ArrowRight) {
+                    pb.step(skip);
+                }
+                // YouTube-style: 5 → 50% of the footage in view.
+                const DIGITS: [Key; 10] = [
+                    Key::Num0,
+                    Key::Num1,
+                    Key::Num2,
+                    Key::Num3,
+                    Key::Num4,
+                    Key::Num5,
+                    Key::Num6,
+                    Key::Num7,
+                    Key::Num8,
+                    Key::Num9,
+                ];
+                for (d, k) in DIGITS.iter().enumerate() {
+                    if i.key_pressed(*k) {
+                        pb.jump_to_fraction(d as f64 / 10.0);
+                    }
+                }
+                if i.key_pressed(Key::Space) {
+                    pb.toggle_pause();
+                }
+                if i.key_pressed(Key::X) {
+                    pb.cycle_speed();
+                    speed_changed = true;
+                }
+            }
+            if i.key_pressed(Key::C) {
+                pb.toggle_calendar();
+            }
+            if i.key_pressed(Key::T) {
+                pb.jump_to_today();
+            }
+        });
+        if speed_changed {
+            self.prefs.playback_speed = pb.speed;
+            self.prefs.save();
         }
     }
 }
@@ -598,6 +973,12 @@ impl eframe::App for App {
             if let Some(r) = self.recorder.take() {
                 r.stop_and_wait();
             }
+            // Record where the user quit — the exact playback position.
+            if let Some(f) = &self.focused {
+                let host = self.cams[f.idx].host.clone();
+                let pos = f.playback.as_ref().map(playback::Playback::position);
+                self.save_view_state(&host, pos, pos.is_some());
+            }
             std::process::exit(0);
         }
         let ctx = ui.ctx().clone();
@@ -688,8 +1069,13 @@ impl eframe::App for App {
                     self.prefs.nerd_stats = !self.prefs.nerd_stats;
                     self.prefs.save();
                 }
+                if ui.input(|i| i.key_pressed(egui::Key::P)) && self.focused.is_some() {
+                    self.playback_key();
+                }
+                self.playback_keys(ui);
             }
         }
+        self.poll_playback();
 
         // Promote every due frame to the screen and wake up exactly when the
         // next scheduled frame is due (smoothing's presentation pump).
@@ -705,6 +1091,9 @@ impl eframe::App for App {
         }
         if let Some(f) = &self.focused {
             bump(f.main.advance(now));
+            if let Some(pb) = &f.playback {
+                bump(pb.advance(now));
+            }
         }
         if let Some(d) = next_due {
             // Quantized to the coalescing window — a frame due in 2 ms must
@@ -729,10 +1118,10 @@ impl eframe::App for App {
         if self.help_open {
             overlay::show_help(
                 &ctx,
-                if self.focused.is_some() {
-                    overlay::HelpContext::Camera
-                } else {
-                    overlay::HelpContext::Grid
+                match &self.focused {
+                    Some(f) if f.playback.is_some() => overlay::HelpContext::Playback,
+                    Some(_) => overlay::HelpContext::Camera,
+                    None => overlay::HelpContext::Grid,
                 },
             );
         }

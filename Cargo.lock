@@ -1479,6 +1479,7 @@ dependencies = [
  "eframe",
  "image",
  "libc",
+ "md-5",
  "serde",
  "serde_json",
  "ureq",

@@ -431,9 +431,13 @@ impl App {
         if !self.prefs.nerd_stats {
             return;
         }
-        // Focused camera's main stream, else the grid's cursor (or last
-        // cursor) tile's substream.
+        // Focused camera's main stream (its substream during playback, when
+        // no main pipe runs — AppDelegate.nerdStatsTarget), else the grid's
+        // cursor (or last cursor) tile's substream.
         let (idx, shared, channel): (usize, &stream::Shared, &'static str) = match &self.focused {
+            Some(f) if f.playback.is_some() => {
+                (f.idx, &self.cams[f.idx].shared, crate::config::SUB_CHANNEL)
+            }
             Some(f) => (f.idx, &f.main, crate::config::MAIN_CHANNEL),
             None if !self.cams.is_empty() => {
                 let i = self
@@ -452,7 +456,7 @@ impl App {
             .map_or("", |c| c.codec_label());
         let target = Target {
             id: cam.id
-                | if self.focused.is_some() {
+                | if channel == crate::config::MAIN_CHANNEL {
                     crate::MAIN_BIT
                 } else {
                     0
