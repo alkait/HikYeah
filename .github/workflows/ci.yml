@@ -15,6 +15,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "clippy, rustfmt" }
       - uses: Swatinem/rust-cache@v2
+      # The FFmpeg libraries the app links (see release.yml for the why).
+      - name: FFmpeg libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev libavfilter-dev
+      - name: FFmpeg libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+      - name: FFmpeg libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL -o ff.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip
+          7z x ff.zip
+          mv ffmpeg-n8.1-latest-win64-gpl-shared-8.1 ffshared
+          echo "FFMPEG_DIR=${{ github.workspace }}\ffshared" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> "$GITHUB_ENV"
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings

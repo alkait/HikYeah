@@ -32,22 +32,50 @@ jobs:
           [ "v$v" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} != Cargo.toml version $v"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # The app links the FFmpeg libraries (ffmpeg-next), so each runner
+      # needs them to build and Linux/Windows archives ship them next to the
+      # binary. Linux/Windows use BtbN's GPL *shared* builds (pinned to the
+      # 8.1 branch; their libav*.so/.dll carry every codec dependency inside),
+      # located through FFMPEG_DIR at build time; the Linux binary gets an
+      # $ORIGIN rpath so the bundled .so files resolve from the archive.
+      # macOS builds against Homebrew's ffmpeg and stays unbundled (no Mac
+      # users yet): it needs `brew install ffmpeg` of the same major.
+      - name: FFmpeg libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev
+          curl -fsSL -o ff.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz
+          mkdir ffshared && tar xf ff.tar.xz -C ffshared --strip-components=1
+          echo "FFMPEG_DIR=$PWD/ffshared" >> "$GITHUB_ENV"
+          echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags' >> "$GITHUB_ENV"
+      - name: FFmpeg libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+      - name: FFmpeg libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL -o ff.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip
+          7z x ff.zip # Git Bash's GNU tar can't read zip
+          mv ffmpeg-n8.1-latest-win64-gpl-shared-8.1 ffshared
+          echo "FFMPEG_DIR=${{ github.workspace }}\ffshared" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> "$GITHUB_ENV"
+
       - run: cargo build --release
 
-      # Static ffmpeg per OS (spawned as a child process, not linked):
-      # Linux/Windows from BtbN's GPL builds (pinned to the 8.1 branch),
-      # macOS arm64 from martin-riedl.de. LICENSE/NOTICE ship in the archive.
       - name: Bundle (Linux)
         if: runner.os == 'Linux'
         run: |
           dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
           mkdir "$dir"
-          curl -fsSL -o ff.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
-          tar xf ff.tar.xz
-          cp ffmpeg-n8.1-latest-linux64-gpl-8.1/bin/ffmpeg "$dir/"
-          cp ffmpeg-n8.1-latest-linux64-gpl-8.1/LICENSE.txt "$dir/FFMPEG-LICENSE.txt"
-          echo "Bundled ffmpeg: GPL build from https://github.com/BtbN/FFmpeg-Builds (source: https://ffmpeg.org)" > "$dir/FFMPEG-NOTICE.txt"
           cp target/release/hikyeah "$dir/"
+          cp ffshared/bin/ffmpeg "$dir/"
+          cp -P ffshared/lib/*.so* "$dir/"
+          cp ffshared/LICENSE.txt "$dir/FFMPEG-LICENSE.txt"
+          echo "Bundled FFmpeg (libraries + ffmpeg binary): GPL shared build from https://github.com/BtbN/FFmpeg-Builds (source: https://ffmpeg.org)" > "$dir/FFMPEG-NOTICE.txt"
+          ldd "$dir/hikyeah" | grep -E "libav|libsw" # must resolve inside the archive
+          ! ldd "$dir/hikyeah" | grep -q "not found"
           tar czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
 
@@ -60,7 +88,7 @@ jobs:
           unzip -o ff.zip -d ffdl
           cp ffdl/ffmpeg "$dir/"
           chmod +x "$dir/ffmpeg"
-          echo "Bundled ffmpeg: GPL build from https://ffmpeg.martin-riedl.de (source: https://ffmpeg.org, license: https://ffmpeg.org/legal.html)" > "$dir/FFMPEG-NOTICE.txt"
+          echo "Bundled ffmpeg binary: GPL build from https://ffmpeg.martin-riedl.de (source: https://ffmpeg.org, license: https://ffmpeg.org/legal.html). The app itself links Homebrew's FFmpeg libraries: brew install ffmpeg." > "$dir/FFMPEG-NOTICE.txt"
           cp target/release/hikyeah "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
@@ -71,12 +99,10 @@ jobs:
         run: |
           dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
           mkdir "$dir"
-          curl -fsSL -o ff.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip
-          7z x ff.zip # Git Bash's GNU tar can't read zip
-          cp ffmpeg-n8.1-latest-win64-gpl-8.1/bin/ffmpeg.exe "$dir/"
-          cp ffmpeg-n8.1-latest-win64-gpl-8.1/LICENSE.txt "$dir/FFMPEG-LICENSE.txt"
-          echo "Bundled ffmpeg: GPL build from https://github.com/BtbN/FFmpeg-Builds (source: https://ffmpeg.org)" > "$dir/FFMPEG-NOTICE.txt"
           cp target/release/hikyeah.exe "$dir/"
+          cp ffshared/bin/ffmpeg.exe ffshared/bin/*.dll "$dir/"
+          cp ffshared/LICENSE.txt "$dir/FFMPEG-LICENSE.txt"
+          echo "Bundled FFmpeg (libraries + ffmpeg binary): GPL shared build from https://github.com/BtbN/FFmpeg-Builds (source: https://ffmpeg.org)" > "$dir/FFMPEG-NOTICE.txt"
           7z a "$dir.zip" "$dir"
           sha256sum "$dir.zip" > "$dir.zip.sha256"
 

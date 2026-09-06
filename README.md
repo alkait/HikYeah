@@ -27,8 +27,8 @@ from 70%, 90% and 635% with the original ffmpeg-per-camera pipes.
 
 One command installs (and later updates — just re-run it). It fetches the
 latest release, verifies its SHA-256, installs to `~/.local/share/hikyeah`
-(with a bundled ffmpeg), symlinks `~/.local/bin/hikyeah`, and adds a desktop
-entry:
+(with the FFmpeg libraries and `ffmpeg` binary bundled), symlinks
+`~/.local/bin/hikyeah`, and adds a desktop entry:
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/install.sh)"
@@ -41,8 +41,9 @@ To uninstall (asks before touching your camera config or prefs):
 ```
 
 Prefer manual? Grab your platform's archive from
-[Releases](https://github.com/alkait/HikYeah/releases), extract, run —
-they're self-contained.
+[Releases](https://github.com/alkait/HikYeah/releases), extract, run. The
+Linux and Windows archives are self-contained; the macOS one needs
+`brew install ffmpeg` (the app links Homebrew's FFmpeg libraries).
 
 ## Run
 
@@ -53,8 +54,14 @@ cargo build --release
 ./target/release/hikyeah           # first camera from config (below)
 ```
 
-Uses the `ffmpeg` sitting next to the executable if there is one (release
-archives bundle a static build), else `ffmpeg` from PATH.
+Building needs the FFmpeg development libraries and libclang (for the
+bindings): Arch `pacman -S ffmpeg clang`; Ubuntu/Debian `apt install
+libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev
+libavfilter-dev pkg-config libclang-dev`; macOS `brew install ffmpeg
+pkg-config`. Any FFmpeg from 6 to 9 works; releases pin BtbN's 8.1 shared
+build via `FFMPEG_DIR`. For clips and playback snapshots the app runs the
+`ffmpeg` sitting next to its executable if there is one (release archives
+bundle it), else `ffmpeg` from PATH.
 
 ## First run
 
