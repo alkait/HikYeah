@@ -87,12 +87,18 @@ fn main() -> eframe::Result {
                     names.push(n);
                 }
             }
+            if std::env::var_os("HIK_DEBUG").is_some() {
+                eprintln!("[render] adapters: {names:?}, wanted {want:?}");
+            }
             render::set_adapter_names(names);
             let pick = want
                 .as_ref()
                 .and_then(|w| usable.iter().find(|a| &a.get_info().name == w))
                 .or_else(|| usable.first())
                 .ok_or("no usable graphics adapter")?;
+            if std::env::var_os("HIK_DEBUG").is_some() {
+                eprintln!("[render] using {:?}", pick.get_info());
+            }
             Ok((*pick).clone())
         });
 
@@ -230,11 +236,15 @@ pub enum UpdateUi {
 /// focused main stream = camera id | MAIN_BIT.
 pub const MAIN_BIT: u64 = 1 << 32;
 
-/// Repaints are coalesced to ~60 Hz: a dozen cameras deliver 200+ frames/s
-/// combined, and repainting per frame burns a core drawing pixels the display
-/// never shows. Every wake asks for "a repaint within 16 ms" instead of "now",
-/// so one redraw presents everything that arrived in the window.
+/// Repaints are coalesced: a dozen cameras deliver 200+ frames/s combined,
+/// and repainting per frame burns a core drawing pixels the display never
+/// shows. Every wake asks for "a repaint within the window" instead of
+/// "now", so one redraw presents everything that arrived in it. The focused
+/// view follows one stream at ~60 Hz; the grid's 25 fps substreams get the
+/// same 2–3 refreshes per frame from a 40 ms window, at ~25 redraws/s —
+/// measured: GPU busy time 39% → 25% on a 5K panel.
 pub const REPAINT_COALESCE: std::time::Duration = std::time::Duration::from_millis(16);
+pub const GRID_COALESCE: std::time::Duration = std::time::Duration::from_millis(40);
 
 impl App {
     fn new(
@@ -389,12 +399,30 @@ impl App {
     }
 
     fn start_streams(&mut self, ctx: &egui::Context) {
-        let hw = self.prefs.hwaccel();
+        // Substreams always decode on the CPU (stream::Decode::Substream);
+        // the Settings choice applies to main streams and playback.
         for cam in &mut self.cams {
             let c = ctx.clone();
-            cam.shared = stream::start(cam.sub_url.clone(), hw, move || {
-                c.request_repaint_after(REPAINT_COALESCE)
-            });
+            cam.shared = stream::start(
+                cam.sub_url.clone(),
+                stream::Decode::Substream,
+                true,
+                GRID_COALESCE,
+                move |d| c.request_repaint_after(d),
+            );
+        }
+    }
+
+    /// Which live streams may wake the screen: in the grid all of them; in
+    /// a camera view only that camera's substream (shown until the main
+    /// stream has a frame). The rest keep decoding silently.
+    fn update_visibility(&self) {
+        let focused = self.focused.as_ref().map(|f| f.idx);
+        for (i, cam) in self.cams.iter().enumerate() {
+            match focused {
+                None => cam.shared.set_visible(true, GRID_COALESCE),
+                Some(f) => cam.shared.set_visible(i == f, REPAINT_COALESCE),
+            }
         }
     }
 
@@ -416,9 +444,13 @@ impl App {
             return;
         };
         let c = ctx.clone();
-        let main = stream::start(url, self.prefs.hwaccel(), move || {
-            c.request_repaint_after(REPAINT_COALESCE)
-        });
+        let main = stream::start(
+            url,
+            stream::Decode::Preferred(self.prefs.hwaccel()),
+            true,
+            REPAINT_COALESCE,
+            move |d| c.request_repaint_after(d),
+        );
         self.focused = Some(Focused {
             idx,
             main,
@@ -427,6 +459,7 @@ impl App {
             playback: None,
             note: None,
         });
+        self.update_visibility();
         self.last_key_sel = idx; // arrows resume from here after unfocus
         self.key_sel = None;
         let host = self.cams[idx].host.clone();
@@ -451,7 +484,9 @@ impl App {
             // Remember the outgoing view (before its playback is torn down).
             let host = self.cams[f.idx].host.clone();
             let pos = f.playback.as_ref().map(playback::Playback::position);
-            drop(f); // stops the main stream and any playback pipe
+            f.main.stop(); // its supervisor would otherwise reconnect forever
+            drop(f); // ends any playback pipe
+            self.update_visibility();
             self.save_view_state(&host, pos, pos.is_some());
             session::save(session::Location::Grid, None);
         }
@@ -614,9 +649,13 @@ impl App {
         f.note = None;
         if let Some(url) = self.cams[f.idx].main_url.clone() {
             let c = self.ctx.clone();
-            f.main = stream::start(url, self.prefs.hwaccel(), move || {
-                c.request_repaint_after(REPAINT_COALESCE)
-            });
+            f.main = stream::start(
+                url,
+                stream::Decode::Preferred(self.prefs.hwaccel()),
+                true,
+                REPAINT_COALESCE,
+                move |d| c.request_repaint_after(d),
+            );
         }
         self.save_view_state(&host, Some(pos), false);
     }
@@ -1086,8 +1125,12 @@ impl eframe::App for App {
                 next_due = Some(next_due.map_or(d, |n| n.min(d)));
             }
         };
-        for cam in &self.cams {
-            bump(cam.shared.advance(now));
+        let focused = self.focused.as_ref().map(|f| f.idx);
+        for (i, cam) in self.cams.iter().enumerate() {
+            let due = cam.shared.advance(now);
+            if focused.is_none_or(|f| f == i) {
+                bump(due);
+            }
         }
         if let Some(f) = &self.focused {
             bump(f.main.advance(now));
@@ -1098,7 +1141,12 @@ impl eframe::App for App {
         if let Some(d) = next_due {
             // Quantized to the coalescing window — a frame due in 2 ms must
             // not re-trigger the per-frame redraw rate this exists to cap.
-            ctx.request_repaint_after(d.saturating_duration_since(now).max(REPAINT_COALESCE));
+            let window = if self.focused.is_some() {
+                REPAINT_COALESCE
+            } else {
+                GRID_COALESCE
+            };
+            ctx.request_repaint_after(d.saturating_duration_since(now).max(window));
         }
 
         let avail = ui.max_rect();

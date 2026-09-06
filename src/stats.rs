@@ -472,7 +472,11 @@ impl App {
             .is_none_or(|t| t.elapsed() >= REFRESH)
             || self.nerd.target != Some(target.id)
         {
-            let decode = self.prefs.decode_label();
+            let decode = if channel == crate::config::SUB_CHANNEL {
+                "CPU (software)"
+            } else {
+                self.prefs.decode_label()
+            };
             let smooth = self.prefs.smooth_live;
             self.nerd.refresh(&target, decode, smooth);
         }

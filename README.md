@@ -6,11 +6,10 @@ Hikvision cameras, any of them one double-click away from a full-window
 main-stream view with digital zoom, and recorded playback straight from
 your NVR with a calendar, a 24-hour timeline and up to 4× speed.
 
-Pipeline: `ffmpeg` (RTSP → decode, NVDEC when available → yuv4mpegpipe on
-stdout) → I420 planes → three R8 wgpu textures → YUV→RGB in a WGSL shader
-during egui's render pass. Only the latest frame is ever shown, so latency
-can't accumulate; ffmpeg is respawned forever on exit or stall, like the Mac
-app. `HIK_SWDEC=1` forces software decode.
+Pipeline: `ffmpeg` (RTSP → decode → yuv4mpegpipe on stdout) → I420 planes →
+three R8 wgpu textures → YUV→RGB in a WGSL shader during egui's render pass.
+Only the latest frame is ever shown, so latency can't accumulate; ffmpeg is
+respawned forever on exit or stall, like the Mac app.
 
 ## Install (Linux)
 
@@ -148,7 +147,10 @@ off" (the grid or the camera you quit from — in playback, at that position;
 on macOS), "Smooth live video" (~0.2 s
 buffer absorbing Wi-Fi jitter; untick for minimum latency), the decode device
 (CPU, NVDEC, Quick Sync, VAAPI, … — only those that pass a startup probe are
-listed) and the render adapter.
+listed; it applies to the main stream and playback, while the grid's small
+substreams always decode on the CPU, where hardware decode was measured to
+cost more than it saves) and the render adapter (on a laptop, pick the
+integrated GPU to keep the discrete one asleep and its fan off).
 
 ## Not ported yet
 

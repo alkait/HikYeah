@@ -281,7 +281,8 @@ impl App {
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    ui.label("Decode");
+                    ui.label("Decode")
+                        .on_hover_text("Main stream and playback. The grid's small substreams always decode on the CPU: for those the GPU round trip costs more CPU than it saves and keeps a discrete GPU awake.");
                     let current = self.prefs.decode_label();
                     let mut options = prefs::available_decode_options();
                     // Keep the active choice visible even if the probe ruled it out.
@@ -328,7 +329,7 @@ impl App {
                             }
                         });
                 });
-                ui.small("Render changes take effect after restart.");
+                ui.small("Decode applies to the main stream and playback; grid substreams always use the CPU. Render changes take effect after restart — on a laptop, the integrated GPU keeps the discrete one asleep.");
                 ui.separator();
 
                 ui.horizontal(|ui| {

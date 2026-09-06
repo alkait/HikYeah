@@ -414,9 +414,12 @@ impl Playback {
 
         let (path, start_clock) = self.client.playback_request(self.track, start, seg.end);
         let ctx = self.ctx.clone();
-        let (shared, stdin) = match stream::start_pipe(self.codec, self.hwaccel, move || {
-            ctx.request_repaint_after(crate::REPAINT_COALESCE)
-        }) {
+        let (shared, stdin) = match stream::start_pipe(
+            self.codec,
+            self.hwaccel,
+            crate::REPAINT_COALESCE,
+            move |d| ctx.request_repaint_after(d),
+        ) {
             Ok(x) => x,
             Err(e) => {
                 self.note = e;

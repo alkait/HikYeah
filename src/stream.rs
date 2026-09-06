@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,12 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Default)]
 pub struct Shared {
+    /// Whether this stream's frames are on screen: a hidden stream (a grid
+    /// substream while a camera is focused) keeps decoding so the grid is
+    /// instant on Esc, but must not wake the UI for every frame.
+    pub visible: AtomicBool,
+    /// Repaint coalescing window for this stream's wakes, in ms.
+    pub coalesce_ms: AtomicU32,
     /// The frame currently on screen (renderer reads this).
     pub current: Mutex<Option<Frame>>,
     /// Frames scheduled for the future, front = next due.
@@ -92,6 +98,29 @@ pub struct Shared {
 }
 
 impl Shared {
+    fn new(visible: bool, coalesce: Duration) -> Arc<Shared> {
+        let sh = Shared::default();
+        sh.visible.store(visible, Ordering::Relaxed);
+        sh.coalesce_ms
+            .store(coalesce.as_millis() as u32, Ordering::Relaxed);
+        Arc::new(sh)
+    }
+
+    pub fn set_visible(&self, visible: bool, coalesce: Duration) {
+        self.visible.store(visible, Ordering::Relaxed);
+        self.coalesce_ms
+            .store(coalesce.as_millis() as u32, Ordering::Relaxed);
+    }
+
+    /// A frame landed: ask for the screen, at this stream's urgency.
+    fn wake(&self, wake: &(impl Fn(Duration) + Send)) {
+        if self.visible.load(Ordering::Relaxed) {
+            wake(Duration::from_millis(u64::from(
+                self.coalesce_ms.load(Ordering::Relaxed),
+            )));
+        }
+    }
+
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         if let Some(mut c) = self.child.lock().unwrap().take() {
@@ -169,36 +198,53 @@ pub fn ffmpeg_path() -> std::path::PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
+/// Which decoder a live stream gets.
+#[derive(Clone, Copy)]
+pub enum Decode {
+    /// Single-thread software decode: the grid's small substreams. Measured
+    /// against NVDEC with sixteen 704×576 streams on a hybrid laptop:
+    /// hardware decode cost *more* CPU (the per-frame GPU→CPU download),
+    /// kept the discrete GPU clocked up (+4 W, its fan on), and frame
+    /// threads only add latency at this size.
+    Substream,
+    /// The user's decode choice (Settings): main stream and playback, where
+    /// a 4K stream is real work.
+    Preferred(Option<&'static str>),
+}
+
 /// What ffmpeg reads.
 pub enum Input {
     /// ffmpeg's own RTSP client (live cameras).
-    Rtsp(String),
+    Rtsp(String, Decode),
     /// Synthetic test pattern (dev/demo).
     Test,
     /// Annex B elementary stream ("hevc" / "h264") pushed into ffmpeg's
-    /// stdin by the caller — the native RTSP playback client (rtsp.rs).
-    Pipe(&'static str),
+    /// stdin by the caller — the native RTSP playback client (rtsp.rs) —
+    /// decoded with the user's choice.
+    Pipe(&'static str, Option<&'static str>),
 }
 
 /// Spawn the supervisor thread: launch ffmpeg, pump frames, relaunch on exit.
-/// `hwaccel` is the user's decode choice (ffmpeg -hwaccel value; None = CPU).
-/// `wake` is called after each published frame (UI repaint).
+/// `wake(window)` is called after each published frame while the stream is
+/// visible — the UI repaints within that window.
 pub fn start(
     url: String,
-    hwaccel: Option<&'static str>,
-    wake: impl Fn() + Send + 'static,
+    decode: Decode,
+    visible: bool,
+    coalesce: Duration,
+    wake: impl Fn(Duration) + Send + 'static,
 ) -> Arc<Shared> {
-    let shared = Arc::new(Shared::default());
+    let shared = Shared::new(visible, coalesce);
     let sh = shared.clone();
     std::thread::spawn(move || {
         let input = if url == "--test" {
             Input::Test
         } else {
-            Input::Rtsp(url)
+            Input::Rtsp(url, decode)
         };
         while !sh.stopped.load(Ordering::SeqCst) {
             sh.set_status("connecting…");
-            match run_once(&sh, &input, hwaccel, &wake) {
+            match run_once(&sh, &input, &wake) {
                 Ok(()) => {}
                 Err(e) => {
                     if std::env::var_os("HIK_DEBUG").is_some() {
@@ -217,7 +263,7 @@ pub fn start(
                 st.fps = 0.0;
                 st.pid = None;
             }
-            wake();
+            sh.wake(&wake);
             std::thread::sleep(Duration::from_secs(2));
         }
     });
@@ -255,11 +301,12 @@ pub fn start(
 pub fn start_pipe(
     codec: &'static str,
     hwaccel: Option<&'static str>,
-    wake: impl Fn() + Send + 'static,
+    coalesce: Duration,
+    wake: impl Fn(Duration) + Send + 'static,
 ) -> Result<(Arc<Shared>, std::process::ChildStdin), String> {
-    let shared = Arc::new(Shared::default());
+    let shared = Shared::new(true, coalesce);
     shared.set_status("connecting…");
-    let mut child = spawn_ffmpeg(&Input::Pipe(codec), hwaccel)?;
+    let mut child = spawn_ffmpeg(&Input::Pipe(codec, hwaccel))?;
     let stdin = child.stdin.take().unwrap();
     let mut out = child.stdout.take().unwrap();
     {
@@ -279,20 +326,15 @@ pub fn start_pipe(
         }
         sh.stats.lock().unwrap().pid = None;
         sh.ended.store(true, Ordering::SeqCst);
-        wake();
+        sh.wake(&wake);
     });
     Ok((shared, stdin))
 }
 
 /// One ffmpeg lifetime: spawn, parse the y4m header, stream frames until EOF.
-fn run_once(
-    sh: &Shared,
-    input: &Input,
-    hwaccel: Option<&'static str>,
-    wake: &(impl Fn() + Send),
-) -> Result<(), String> {
+fn run_once(sh: &Shared, input: &Input, wake: &(impl Fn(Duration) + Send)) -> Result<(), String> {
     let launch = Instant::now();
-    let mut child = spawn_ffmpeg(input, hwaccel)?;
+    let mut child = spawn_ffmpeg(input)?;
     let mut out = child.stdout.take().unwrap();
     {
         let mut st = sh.stats.lock().unwrap();
@@ -300,10 +342,18 @@ fn run_once(
         st.last_activity = Some(Instant::now());
     }
     *sh.child.lock().unwrap() = Some(child);
-    pump(sh, &mut out, true, launch, wake)
+    let result = pump(sh, &mut out, true, launch, wake);
+    // Reap the child whatever ended the pump (its exit, a stall kill, a
+    // header we couldn't parse) — an un-waited ffmpeg lingers as a zombie
+    // on every reconnect.
+    if let Some(mut c) = sh.child.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    result
 }
 
-fn spawn_ffmpeg(input: &Input, hwaccel: Option<&'static str>) -> Result<Child, String> {
+fn spawn_ffmpeg(input: &Input) -> Result<Child, String> {
     let mut cmd = Command::new(ffmpeg_path());
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     match input {
@@ -312,21 +362,24 @@ fn spawn_ffmpeg(input: &Input, hwaccel: Option<&'static str>) -> Result<Child, S
             // -re paces lavfi at realtime, like a camera would.
             cmd.args(["-re", "-f", "lavfi", "-i", "testsrc2=size=704x576:rate=25"]);
         }
-        Input::Rtsp(url) => {
-            cmd.args([
-                "-rtsp_transport",
-                "tcp",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-            ]);
-            if let Some(hw) = hwaccel {
-                cmd.args(["-hwaccel", hw]);
+        Input::Rtsp(url, decode) => {
+            // No "-fflags nobuffer": with HEVC over RTSP it makes the parser
+            // hand the decoder split NALs — measured on a 4K 20 fps camera:
+            // half the frames lost, constant RPS errors costing half a core,
+            // and the first frame at 4.3 s instead of 1.5 s.
+            cmd.args(["-rtsp_transport", "tcp", "-flags", "low_delay"]);
+            match decode {
+                Decode::Substream => {
+                    cmd.args(["-threads", "1"]);
+                }
+                Decode::Preferred(Some(hw)) => {
+                    cmd.args(["-hwaccel", hw]);
+                }
+                Decode::Preferred(None) => {}
             }
             cmd.args(["-i", url]);
         }
-        Input::Pipe(codec) => {
+        Input::Pipe(codec, hwaccel) => {
             // No "-fflags nobuffer" here: on a raw elementary stream read
             // from a pipe it makes the parser hand the decoder split NALs
             // (measured: every frame errors, first picture lands a GOP late).
@@ -350,7 +403,7 @@ fn spawn_ffmpeg(input: &Input, hwaccel: Option<&'static str>) -> Result<Child, S
     } else {
         Stdio::null()
     });
-    cmd.stdin(if matches!(input, Input::Pipe(_)) {
+    cmd.stdin(if matches!(input, Input::Pipe(..)) {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -379,7 +432,7 @@ fn pump(
     out: &mut std::process::ChildStdout,
     live: bool,
     launch: Instant,
-    wake: &(impl Fn() + Send),
+    wake: &(impl Fn(Duration) + Send),
 ) -> Result<(), String> {
     // y4m stream header, e.g. "YUV4MPEG2 W704 H576 F25:1 Ip A1:1 C420mpeg2\n".
     let header = read_line(out)?;
@@ -496,7 +549,7 @@ fn pump(
                 win_frames = 0;
             }
         }
-        wake();
+        sh.wake(wake);
     }
 }
 
