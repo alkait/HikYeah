@@ -611,6 +611,7 @@ impl Drop for MappedFrame {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn debug(msg: &str) {
     if std::env::var_os("HIK_DEBUG").is_some() {
         eprintln!("[decode] {msg}");
