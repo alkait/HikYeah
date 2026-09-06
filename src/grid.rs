@@ -223,6 +223,7 @@ impl App {
             && self.save_prompts.is_empty()
             && self.drag.is_none()
             && self.bookmark_pane.is_none()
+            && self.event_pane.is_none()
             && self.bookmark_prompt.is_none()
         {
             let arrows = ui.input(|i| {

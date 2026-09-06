@@ -16,6 +16,7 @@
 mod bookmarks;
 mod config;
 mod decode;
+mod events;
 mod focused;
 mod gpu;
 mod grid;
@@ -239,6 +240,12 @@ pub struct App {
     pub bookmarks: bookmarks::Store,
     pub bookmark_prompt: Option<bookmarks::Prompt>,
     pub bookmark_pane: Option<bookmarks::Pane>,
+    pub event_pane: Option<events::Pane>,
+    pub event_memo: events::Memo,
+    pub seen: events::SeenStore,
+    /// Warm today's + yesterday's event log once the NVR client lands
+    /// (launch and Settings saves, like the Mac app's warmEventLog).
+    warm_events: bool,
     /// Zero-copy video is available (gpu.rs); decoders read it per frame.
     pub zero_copy: gpu::ZeroCopy,
     /// A P press waiting on the NVR client: (camera index, start position).
@@ -348,6 +355,10 @@ impl App {
             bookmarks: bookmarks::Store::load(),
             bookmark_prompt: None,
             bookmark_pane: None,
+            event_pane: None,
+            event_memo: Default::default(),
+            seen: events::SeenStore::load(),
+            warm_events: false,
             zero_copy,
             pending_playback: None,
             top_bar: false,
@@ -398,6 +409,8 @@ impl App {
         {
             app.focus(idx, &cc.egui_ctx);
         }
+        app.warm_events = true;
+        app.ensure_nvr();
         app
     }
 
@@ -423,6 +436,7 @@ impl App {
         self.drag = None;
         self.nvr = NvrState::Idle; // pick up NVR credential changes lazily
         self.pending_playback = None;
+        self.warm_events = true;
         let stored = self
             .config
             .as_ref()
@@ -639,25 +653,34 @@ impl App {
             return;
         }
         let idx = f.idx;
-        let Some(nvr) = self.config.as_ref().and_then(|c| c.nvr.clone()) else {
+        if self.config.as_ref().and_then(|c| c.nvr.as_ref()).is_none() {
             f.note = Some("no NVR in Settings (Ctrl-,)".into());
             return;
-        };
+        }
         f.note = Some("loading recordings…".into());
         self.pending_playback = Some((idx, start_at));
-        match &self.nvr {
-            NvrState::Ready(_) => self.poll_nvr(),
-            NvrState::Preparing(_) => {}
-            NvrState::Idle => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let ctx = self.ctx.clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(nvr::Client::prepare(nvr));
-                    ctx.request_repaint();
-                });
-                self.nvr = NvrState::Preparing(rx);
-            }
+        self.ensure_nvr();
+        if let NvrState::Ready(_) = &self.nvr {
+            self.poll_nvr();
         }
+    }
+
+    /// Prepare the NVR client on a thread if there is an NVR and no client
+    /// yet; `poll_nvr` adopts it. A no-op without an NVR in Settings.
+    pub fn ensure_nvr(&mut self) {
+        if !matches!(self.nvr, NvrState::Idle) {
+            return;
+        }
+        let Some(nvr) = self.config.as_ref().and_then(|c| c.nvr.clone()) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(nvr::Client::prepare(nvr));
+            ctx.request_repaint();
+        });
+        self.nvr = NvrState::Preparing(rx);
     }
 
     /// The NVR client landed (or was already there): start the pending
@@ -667,12 +690,20 @@ impl App {
             && let Ok(result) = rx.try_recv()
         {
             match result {
-                Ok(c) => self.nvr = NvrState::Ready(Arc::new(c)),
+                Ok(c) => {
+                    self.nvr = NvrState::Ready(Arc::new(c));
+                    if std::mem::take(&mut self.warm_events) {
+                        self.warm_event_log();
+                    }
+                }
                 Err(e) => {
                     self.nvr = NvrState::Idle;
                     self.pending_playback = None;
                     if let Some(f) = &mut self.focused {
                         f.note = Some(e);
+                    }
+                    if let Some(p) = &mut self.event_pane {
+                        p.fail("NVR unreachable");
                     }
                     return;
                 }
@@ -946,6 +977,8 @@ impl App {
             } else {
                 self.bookmark_pane = None;
             }
+        } else if self.event_pane.is_some() {
+            self.event_pane_escape();
         } else if self.drag.is_some() {
             self.cancel_drag();
         } else if self.key_sel.is_some() {
@@ -1212,13 +1245,19 @@ impl eframe::App for App {
         // The help sheet swallows the key or click that closes it; text
         // fields keep their keystrokes (a "?" in a password is a "?").
         // The bookmark pane owns the keyboard while up (filter typing).
-        if self.bookmark_pane.is_some() {
+        if self.bookmark_pane.is_some() || self.event_pane.is_some() {
             let events = ui.input(|i| i.events.clone());
             for e in &events {
-                self.bookmark_pane_key(e);
+                if self.bookmark_pane.is_some() {
+                    self.bookmark_pane_key(e);
+                } else {
+                    self.event_pane_key(e);
+                }
             }
         }
-        let typing = ctx.egui_wants_keyboard_input() || self.bookmark_pane.is_some();
+        let typing = ctx.egui_wants_keyboard_input()
+            || self.bookmark_pane.is_some()
+            || self.event_pane.is_some();
         let help_was_open = self.help_open;
         if help_was_open {
             if ui.input(|i| {
@@ -1279,10 +1318,19 @@ impl eframe::App for App {
                         self.prompt_bookmark();
                     }
                 }
+                // Shift-E: the intrusion pane, from any context (plain E
+                // stays the band selector in playback).
+                if ui
+                    .input(|i| chord(i, egui::Key::E))
+                    .is_some_and(|m| m.shift)
+                {
+                    self.toggle_event_pane();
+                }
                 self.playback_keys(ui);
             }
         }
         self.poll_playback();
+        self.poll_event_pane();
 
         // Promote every due frame to the screen and wake up exactly when the
         // next scheduled frame is due (smoothing's presentation pump).
@@ -1327,6 +1375,7 @@ impl eframe::App for App {
         self.show_nerd_stats(&ctx);
         self.show_bookmark_prompt(&ctx);
         self.show_bookmark_pane(&ctx);
+        self.show_event_pane(&ctx);
         self.show_save_prompt(&ctx);
         self.show_top_bar(&ctx);
         self.show_update_banner(&ctx);

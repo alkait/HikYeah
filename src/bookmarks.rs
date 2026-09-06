@@ -166,6 +166,7 @@ impl App {
             return;
         }
         self.help_open = false;
+        self.close_event_pane();
         self.bookmark_pane = Some(Pane {
             filter: String::new(),
             sel: None,
