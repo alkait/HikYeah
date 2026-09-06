@@ -129,7 +129,7 @@ impl NerdStats {
         }
         let st = target.shared.stats.lock().unwrap().clone();
         let app_cpu = cpu_seconds(None).unwrap_or(0.0);
-        let ff_cpu = st.pid.and_then(|p| cpu_seconds(Some(p))).unwrap_or(0.0);
+        let ff_cpu = st.tid.and_then(|t| cpu_seconds(Some(t))).unwrap_or(0.0);
         self.history.push(Tick {
             t: now,
             frames: st.frames,

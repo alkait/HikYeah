@@ -414,19 +414,12 @@ impl Playback {
 
         let (path, start_clock) = self.client.playback_request(self.track, start, seg.end);
         let ctx = self.ctx.clone();
-        let (shared, stdin) = match stream::start_pipe(
+        let (shared, sink) = stream::start_pipe(
             self.codec,
             self.hwaccel,
             crate::REPAINT_COALESCE,
             move |d| ctx.request_repaint_after(d),
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                self.note = e;
-                self.loading = false;
-                return;
-            }
-        };
+        );
         let status = shared.clone();
         let ctx = self.ctx.clone();
         let session = rtsp::start(
@@ -440,7 +433,7 @@ impl Playback {
                 scale: self.speed,
                 codec: self.codec,
             },
-            stdin,
+            sink,
             move |s| {
                 status.set_status(s);
                 ctx.request_repaint();

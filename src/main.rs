@@ -14,6 +14,7 @@
 //   hikyeah --test         ffmpeg synthetic test pattern (no camera needed)
 
 mod config;
+mod decode;
 mod focused;
 mod grid;
 mod isapi;
@@ -67,6 +68,7 @@ fn main() -> eframe::Result {
     #[cfg(not(target_os = "linux"))]
     let instance_lock: Option<std::fs::File> = None;
 
+    decode::init();
     let app_prefs = prefs::Prefs::load();
     stream::SMOOTH.store(app_prefs.smooth_live, std::sync::atomic::Ordering::Relaxed);
     prefs::start_probe();

@@ -12,6 +12,7 @@ serde_json = "1.0.151"
 ureq = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 md-5 = "0.10"
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "device", "software-scaling"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

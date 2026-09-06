@@ -6,10 +6,14 @@ Hikvision cameras, any of them one double-click away from a full-window
 main-stream view with digital zoom, and recorded playback straight from
 your NVR with a calendar, a 24-hour timeline and up to 4× speed.
 
-Pipeline: `ffmpeg` (RTSP → decode → yuv4mpegpipe on stdout) → I420 planes →
-three R8 wgpu textures → YUV→RGB in a WGSL shader during egui's render pass.
-Only the latest frame is ever shown, so latency can't accumulate; ffmpeg is
-respawned forever on exit or stall, like the Mac app.
+Pipeline: the FFmpeg libraries decode in-process (libavformat speaks RTSP,
+libavcodec decodes — on NVDEC, VAAPI, Quick Sync, … when chosen) and each
+picture lands directly in wgpu textures (I420 as three R8 planes, NV12 from a
+hardware decoder as R8 + RG8), converted to RGB in a WGSL shader during
+egui's render pass. Only the latest frame is ever shown, so latency can't
+accumulate; a stream reconnects forever on exit or stall, like the Mac app.
+The `ffmpeg` binary is used only for clips, playback snapshots and the
+decoder probe.
 
 ## Install (Linux)
 
