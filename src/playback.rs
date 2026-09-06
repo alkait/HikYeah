@@ -534,8 +534,12 @@ impl Playback {
         self.transport = Some((start, false));
     }
 
+    /// The label keeps the pipe's last text across a pause (the Mac tile's
+    /// setStatus only fires on state changes, so "3840×2160" stays up).
     fn stop_stream(&mut self) {
-        self.stream = None;
+        if let Some(s) = self.stream.take() {
+            self.note = s.shared.stats.lock().unwrap().status.clone();
+        }
     }
 
     /// The pipe EOF'd: the segment played out, or we caught up with "now".
