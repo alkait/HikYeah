@@ -8,14 +8,15 @@
 //
 // Each stream runs on its own thread; nothing here touches the UI.
 
+#[cfg(target_os = "linux")]
 use crate::gpu::DmaFrame;
 use crate::stream::{Decode, Pacer, PixFmt, STALL_TIMEOUT, Shared};
 use ffmpeg_next as ff;
 use ffmpeg_next::ffi as sys;
 use std::ffi::{CStr, CString, c_void};
 use std::io::Read;
-use std::os::fd::FromRawFd;
 use std::ptr;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
@@ -253,6 +254,7 @@ unsafe extern "C" fn get_format(
 
 /// One decoder: demuxer, codec, optional hardware device, and the scratch
 /// frames for downloads and conversions.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // zero-copy fields
 struct Session {
     ictx: ff::format::context::Input,
     stream_index: usize,
@@ -413,6 +415,7 @@ impl Session {
     ) -> Result<(), String> {
         while self.decoder.receive_frame(&mut self.frame).is_ok() {
             let is_hw = Some(self.frame.format().into()) == self.hw_fmt;
+            #[cfg(target_os = "linux")]
             if is_hw
                 && self
                     .zero_copy
@@ -494,6 +497,7 @@ impl Session {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Session {
     /// Map the decoded VAAPI surface to a DRM PRIME descriptor (one
     /// DMA-BUF, NV12 as two layers) and wrap it for the renderer. The mapped
@@ -571,7 +575,7 @@ impl Session {
             if dup < 0 {
                 return None;
             }
-            let fd = std::os::fd::OwnedFd::from_raw_fd(dup);
+            let fd = <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(dup);
             let mut st: libc::stat = std::mem::zeroed();
             if libc::fstat(obj.fd, &raw mut st) != 0 {
                 return None;
@@ -590,13 +594,17 @@ impl Session {
 }
 
 /// A mapped DRM PRIME frame; unmapping it releases the decoder's surface.
+#[cfg(target_os = "linux")]
 struct MappedFrame(*mut sys::AVFrame);
 
 // The pointer is only ever freed here, and libavutil's refcounting is
 // thread-safe, so the wrapper may travel between threads.
+#[cfg(target_os = "linux")]
 unsafe impl Send for MappedFrame {}
+#[cfg(target_os = "linux")]
 unsafe impl Sync for MappedFrame {}
 
+#[cfg(target_os = "linux")]
 impl Drop for MappedFrame {
     fn drop(&mut self) {
         unsafe { sys::av_frame_free(&raw mut self.0) };

@@ -9,13 +9,13 @@
 // platforms, a discrete adapter, a driver without the extensions) keeps the
 // download path in decode.rs.
 
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 /// One exported VAAPI surface: a DMA-BUF holding NV12 as two planes.
+#[cfg(target_os = "linux")]
 pub struct DmaFrame {
-    pub fd: OwnedFd,
+    pub fd: std::os::fd::OwnedFd,
     /// Identity of the buffer behind the fd (its inode): surfaces are
     /// pooled by the decoder, so the same buffer comes around again and its
     /// imported textures can be reused.
@@ -27,6 +27,13 @@ pub struct DmaFrame {
     pub planes: [(u64, u64); 2],
     /// Keeps the decoder's surface alive while this frame exists.
     pub keep: Box<dyn Send + Sync>,
+}
+
+/// Zero-copy frames don't exist off Linux; the type keeps `Frame` uniform.
+#[cfg(not(target_os = "linux"))]
+pub struct DmaFrame {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Runtime switch for the zero-copy path: on when the device supports it,
