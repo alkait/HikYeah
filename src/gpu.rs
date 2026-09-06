@@ -32,6 +32,7 @@ pub struct DmaFrame {
 /// Zero-copy frames don't exist off Linux; the type keeps `Frame` uniform.
 #[cfg(not(target_os = "linux"))]
 pub struct DmaFrame {
+    pub ino: u64,
     pub width: u32,
     pub height: u32,
 }
