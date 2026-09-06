@@ -79,6 +79,8 @@ impl HelpContext {
                 ("← →", "seek 10 s · ⇧ 60 s · Ctrl 15 min"),
                 ("0–9", "jump within visible footage"),
                 ("X", "speed 1× → 2× → 4×"),
+                ("N / ⇧N", "next / previous event"),
+                ("E", "event bands · motion / intrusion"),
                 ("C", "calendar · arrows + ↵ pick a day"),
                 ("T", "jump to today"),
                 ("S", "snapshot at this position"),

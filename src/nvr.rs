@@ -9,9 +9,11 @@
 
 use crate::config::{StoredNvr, url_encode};
 use crate::isapi::{self, blocks, tag};
-use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Offset, TimeZone, Utc};
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Offset, TimeDelta, TimeZone, Utc};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Segment {
@@ -23,6 +25,42 @@ pub struct Client {
     pub nvr: StoredNvr,
     pub tz: FixedOffset,
     pub channel_by_host: HashMap<String, u32>,
+    events: Mutex<EventState>,
+}
+
+/// Spans per NVR channel.
+pub type Spans = HashMap<u32, Vec<Segment>>;
+
+/// Motion and intrusion spans for every channel of one window, from the
+/// NVR's alarm log (motionStart/Stop and fieldDetectionStart/Stop pairs —
+/// the recordings themselves are continuous and carry no event typing).
+#[derive(Default)]
+pub struct EventLog {
+    pub motion: Spans,
+    pub intrusion: Spans,
+}
+
+/// Caches and the crawl queue. The NVR's log search runs ONE server-side
+/// session: each crawl re-sends its searchID to page that session, so two
+/// concurrent crawls (e.g. the launch warm-up covering today + yesterday)
+/// interleave searchIDs, keep resetting each other's session, and can wedge
+/// into pagination that never terminates — callers then hang on "loading"
+/// forever. Serialize: one crawl at a time, the rest wait their turn.
+#[derive(Default)]
+struct EventState {
+    /// By window start (unix seconds): when fetched, and the log.
+    log_cache: HashMap<i64, (Instant, Arc<EventLog>)>,
+    /// Deliveries waiting on an in-flight crawl, by window start.
+    log_pending: HashMap<i64, Vec<Sender<Arc<EventLog>>>>,
+    queue: VecDeque<(DateTime<Utc>, DateTime<Utc>)>,
+    crawling: bool,
+    /// "channel|type|from": AcuSense-classified spans.
+    target_cache: HashMap<String, (Instant, Arc<Vec<Segment>>)>,
+}
+
+/// Past days never change; today's entries go stale as new events land.
+fn cache_valid(stamp: Instant, window_end: DateTime<Utc>) -> bool {
+    window_end < Utc::now() || stamp.elapsed() < Duration::from_secs(60)
 }
 
 /// Recording track for an NVR channel: main-stream recording is
@@ -47,6 +85,7 @@ impl Client {
             nvr,
             tz,
             channel_by_host,
+            events: Mutex::default(),
         })
     }
 
@@ -197,6 +236,337 @@ impl Client {
             Duration::from_secs(timeout_secs),
         )
     }
+}
+
+impl Client {
+    // MARK: event log (generic motion + intrusion) + human/vehicle classified
+
+    /// Motion and intrusion spans for ALL channels in [from, to). One fetch
+    /// serves every camera and both event types. May deliver twice on `tx`:
+    /// instantly with cached data (even stale), then again with fresh data
+    /// once a revalidating crawl lands; the sender is dropped when nothing
+    /// more will come. Concurrent calls for the same window share one crawl.
+    pub fn event_log(
+        self: &Arc<Self>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        tx: Sender<Arc<EventLog>>,
+    ) {
+        let key = from.timestamp();
+        let mut st = self.events.lock().unwrap();
+        if let Some((stamp, log)) = st.log_cache.get(&key) {
+            let _ = tx.send(log.clone());
+            if cache_valid(*stamp, to) {
+                return;
+            }
+            // Stale (today, >60 s old) — deliver again after revalidating.
+        }
+        if let Some(waiting) = st.log_pending.get_mut(&key) {
+            waiting.push(tx); // a crawl is already running or queued
+            return;
+        }
+        st.log_pending.insert(key, vec![tx]);
+        st.queue.push_back((from, to));
+        if st.crawling {
+            return;
+        }
+        st.crawling = true;
+        drop(st);
+        let me = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                let next = me.events.lock().unwrap().queue.pop_front();
+                let Some((from, to)) = next else {
+                    me.events.lock().unwrap().crawling = false;
+                    return;
+                };
+                let log = Arc::new(me.crawl_log(from, to));
+                let mut st = me.events.lock().unwrap();
+                st.log_cache
+                    .insert(from.timestamp(), (Instant::now(), log.clone()));
+                for tx in st.log_pending.remove(&from.timestamp()).unwrap_or_default() {
+                    let _ = tx.send(log.clone());
+                }
+            }
+        });
+    }
+
+    /// The stitched alarm-log crawl. The NVR silently truncates every log
+    /// search at 2000 entries — no error, no MORE flag, it just looks like a
+    /// clean end of data. All log types count against the cap (the subName
+    /// filter below is ignored), so on a busy day a full-day search ends
+    /// hours early and the rest of the day shows no motion. When a search
+    /// dies at the cap, stitch: run a fresh search from the last entry's
+    /// timestamp (inclusive, so same-second entries survive; `seen` dedupes
+    /// the overlap) until the window is genuinely covered.
+    fn crawl_log(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> EventLog {
+        const SEARCH_CAP: usize = 2000;
+        let started = Instant::now();
+        let mut motion: Vec<(u32, bool, DateTime<Utc>)> = Vec::new();
+        let mut intrusion: Vec<(u32, bool, DateTime<Utc>)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new(); // "metaId|time" across stitched searches
+        let mut cursor = from;
+        let mut restarts_left = 16;
+        'sessions: loop {
+            // One searchID for the whole session: re-sending it lets the NVR
+            // serve pages from its existing server-side search (~10 ms each);
+            // a fresh ID per page makes it re-run the search every time
+            // (~570 ms each — 31 s for a busy day).
+            let search_id = search_id();
+            let mut session_count = 0usize;
+            let mut last_time = cursor;
+            let mut position = 0usize;
+            loop {
+                // Termination backstop: no sane day has this many log
+                // entries; beyond it assume the NVR is stuck answering MORE
+                // and bail with what we have rather than paging forever.
+                if position >= 50_000 {
+                    break 'sessions;
+                }
+                let body = format!(
+                    "<CMSearchDescription><searchID>{search_id}</searchID><metaId>log.std-cgi.com</metaId>\
+                     <timeSpanList><timeSpan><startTime>{}</startTime><endTime>{}</endTime></timeSpan></timeSpanList>\
+                     <maxResults>64</maxResults><searchResultPostion>{position}</searchResultPostion>\
+                     <metadataList><metadataDescriptor>//metadata.std-cgi.com/types/logs?name=alarm&amp;subName=motionalarm</metadataDescriptor></metadataList>\
+                     </CMSearchDescription>",
+                    self.fmt_z(cursor),
+                    self.fmt_z(to)
+                );
+                let Some(resp) = self.post("/ISAPI/ContentMgmt/logSearch", &body, 10) else {
+                    break 'sessions;
+                };
+                let xml = String::from_utf8_lossy(&resp);
+                let items: Vec<(&str, &str)> = blocks(&xml, "searchMatchItem")
+                    .into_iter()
+                    .filter_map(|item| {
+                        let meta = tag(item, "metaId")?.trim();
+                        let time = tag(item, "StartDateTime")?.trim();
+                        (!meta.is_empty() && !time.is_empty()).then_some((meta, time))
+                    })
+                    .collect();
+                session_count += items.len();
+                for (meta, time) in &items {
+                    // Response times: local, no suffix.
+                    let Some(t) = NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H:%M:%S")
+                        .ok()
+                        .and_then(|n| self.tz.from_local_datetime(&n).single())
+                        .map(|d| d.with_timezone(&Utc))
+                    else {
+                        continue;
+                    };
+                    if t > last_time {
+                        last_time = t;
+                    }
+                    if !seen.insert(format!("{meta}|{time}")) {
+                        continue;
+                    }
+                    // metaId: log.hikvision.com/Alarm/motionStart/15,
+                    //         …/Alarm/fieldDetectionStart/9 (= intrusion)
+                    let parts: Vec<&str> = meta.split('/').collect();
+                    let (Some(kind), Some(ch)) = (
+                        parts.len().checked_sub(2).map(|i| parts[i]),
+                        parts.last().and_then(|c| c.parse::<u32>().ok()),
+                    ) else {
+                        continue;
+                    };
+                    match kind {
+                        "motionStart" => motion.push((ch, true, t)),
+                        "motionStop" => motion.push((ch, false, t)),
+                        "fieldDetectionStart" => intrusion.push((ch, true, t)),
+                        "fieldDetectionStop" => intrusion.push((ch, false, t)),
+                        _ => {}
+                    }
+                }
+                let more = tag(&xml, "responseStatusStrg").map(str::trim) == Some("MORE");
+                if more && !items.is_empty() {
+                    position += items.len();
+                } else if session_count >= SEARCH_CAP
+                    && last_time > cursor
+                    && last_time < to
+                    && restarts_left > 0
+                {
+                    // Quirk: the NVR filters *Stop entries by their event's
+                    // START time, so restarting exactly at the cap would drop
+                    // the stop of any motion still running across the restart
+                    // point (leaving a falsely open span). Back the cursor
+                    // off 30 min to re-cover straddlers; `seen` dedupes the
+                    // overlap, and max() keeps forward progress.
+                    cursor =
+                        (cursor + TimeDelta::seconds(1)).max(last_time - TimeDelta::seconds(1800));
+                    restarts_left -= 1;
+                    continue 'sessions;
+                } else {
+                    break 'sessions;
+                }
+            }
+        }
+        let log = EventLog {
+            motion: pair_events(&motion, from, to),
+            intrusion: pair_events(&intrusion, from, to),
+        };
+        if std::env::var_os("HIK_DEBUG").is_some() {
+            eprintln!(
+                "[nvr] alarm log {}: {} entries, {} motion / {} intrusion spans, {:.1} s, {} restarts",
+                self.local(from).format("%F"),
+                seen.len(),
+                log.motion.values().map(Vec::len).sum::<usize>(),
+                log.intrusion.values().map(Vec::len).sum::<usize>(),
+                started.elapsed().as_secs_f32(),
+                16 - restarts_left
+            );
+        }
+        log
+    }
+
+    /// AcuSense-classified motion spans ("human" or "vehicle") for one
+    /// channel in [from, to) via /ISAPI/ContentMgmt/SearchByTargetType — the
+    /// same API behind the NVR web player's Human/Vehicle checkboxes.
+    /// Response times look like real ISO 8601 with offsets, but the offset
+    /// lies on fresh records: for ~20–80 s after an event the NVR reports the
+    /// local wall clock with "+00:00", then re-reports the same record with
+    /// the true offset. Trusting it threw just-happened events 4 h into the
+    /// future — a phantom tick beyond the recorded band — so parse the digits
+    /// as NVR-local and ignore the offset.
+    pub fn classified_spans(
+        &self,
+        channel: u32,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        target: &str,
+    ) -> Arc<Vec<Segment>> {
+        let key = format!("{channel}|{target}|{}", from.timestamp());
+        if let Some((stamp, spans)) = self.events.lock().unwrap().target_cache.get(&key)
+            && cache_valid(*stamp, to)
+        {
+            return spans.clone();
+        }
+        let fmt = |t: DateTime<Utc>| self.local(t).format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+        let parse = |v: &serde_json::Value| -> Option<DateTime<Utc>> {
+            let s = v.as_str()?;
+            if s.len() < 19 {
+                return None;
+            }
+            let n = NaiveDateTime::parse_from_str(&s[..19], "%Y-%m-%dT%H:%M:%S").ok()?;
+            Some(
+                self.tz
+                    .from_local_datetime(&n)
+                    .single()?
+                    .with_timezone(&Utc),
+            )
+        };
+        let search_id = search_id(); // one per search: pages reuse the NVR's session
+        let mut all = Vec::new();
+        let mut position = 0usize;
+        loop {
+            let body = serde_json::json!({
+                "SearchDescription": {
+                    "searchID": search_id,
+                    "searchResultPosition": position,
+                    "maxResults": 100,
+                    "SearchCondList": [{
+                        "channelID": channel,
+                        "targetTypes": [target],
+                        "searchTimeList": [{"searchTime": {"startTime": fmt(from), "endTime": fmt(to)}}],
+                    }],
+                }
+            })
+            .to_string();
+            let Some(resp) = isapi::request(
+                &self.nvr.host,
+                &self.nvr.user,
+                &self.nvr.password,
+                "/ISAPI/ContentMgmt/SearchByTargetType?format=json",
+                Some(("application/json", body.as_bytes())),
+                Duration::from_secs(10),
+            ) else {
+                break;
+            };
+            let Ok(root) = serde_json::from_slice::<serde_json::Value>(&resp) else {
+                break;
+            };
+            let result = &root["SearchResult"];
+            let status = result["responseStatusStrg"].as_str().unwrap_or("");
+            let mut count = 0usize;
+            for m in result["matchList"].as_array().into_iter().flatten() {
+                for info in m["RecordInfoList"].as_array().into_iter().flatten() {
+                    count += 1;
+                    if let (Some(s), Some(e)) = (
+                        parse(&info["RecordTime"]["startTime"]),
+                        parse(&info["RecordTime"]["endTime"]),
+                    ) && e > s
+                    {
+                        all.push(Segment { start: s, end: e });
+                    }
+                }
+            }
+            if status == "MORE" && count > 0 {
+                position += count;
+            } else {
+                break;
+            }
+        }
+        let spans = Arc::new(merge(all));
+        self.events
+            .lock()
+            .unwrap()
+            .target_cache
+            .insert(key, (Instant::now(), spans.clone()));
+        spans
+    }
+}
+
+/// Start/stop entries into spans. A channel can have overlapping events
+/// (the NVR logs each detection region independently: start/start/stop/
+/// stop), so track open depth — the span closes only when every open event
+/// has stopped. Otherwise the second stop looks orphaned and takes the
+/// began-before-window fallback, painting a false band from the window
+/// start.
+fn pair_events(
+    events: &[(u32, bool, DateTime<Utc>)],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Spans {
+    let mut sorted: Vec<&(u32, bool, DateTime<Utc>)> = events.iter().collect();
+    sorted.sort_by_key(|e| e.2);
+    let mut out: Spans = HashMap::new();
+    let mut open: HashMap<u32, (DateTime<Utc>, u32)> = HashMap::new();
+    for &(ch, is_start, t) in sorted {
+        if is_start {
+            match open.get_mut(&ch) {
+                Some(o) => o.1 += 1,
+                None => {
+                    open.insert(ch, (t, 1));
+                }
+            }
+        } else if let Some(o) = open.get_mut(&ch) {
+            if o.1 > 1 {
+                o.1 -= 1;
+            } else {
+                let since = o.0;
+                open.remove(&ch);
+                out.entry(ch).or_default().push(Segment {
+                    start: since,
+                    end: t,
+                });
+            }
+        } else {
+            // Stop without any start: motion began before the window.
+            out.entry(ch).or_default().push(Segment {
+                start: from,
+                end: t,
+            });
+        }
+    }
+    let clamp = to.min(Utc::now());
+    for (ch, (since, _)) in open {
+        if since < clamp {
+            out.entry(ch).or_default().push(Segment {
+                start: since,
+                end: clamp,
+            });
+        }
+    }
+    out.into_iter().map(|(ch, v)| (ch, merge(v))).collect()
 }
 
 fn get(nvr: &StoredNvr, path: &str) -> Option<Vec<u8>> {

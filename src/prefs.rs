@@ -38,6 +38,22 @@ pub struct Prefs {
     /// Playback speed (1/2/4×) — one preference shared across cameras.
     #[serde(default = "default_speed")]
     pub playback_speed: u32,
+    /// Which event band the playback timeline highlights: none, motion,
+    /// intrusion (one global choice, like speed).
+    #[serde(default = "default_band")]
+    pub event_band: String,
+    /// Motion refinement: any of "human", "vehicle" (both on by default →
+    /// AcuSense search; neither → the alarm log).
+    #[serde(default = "default_filter")]
+    pub motion_filter: Vec<String>,
+}
+
+fn default_band() -> String {
+    "motion".into()
+}
+
+fn default_filter() -> Vec<String> {
+    vec!["human".into(), "vehicle".into()]
 }
 
 fn default_speed() -> u32 {
@@ -60,6 +76,8 @@ impl Default for Prefs {
             nerd_pos: None,
             save_dir: None,
             playback_speed: 1,
+            event_band: default_band(),
+            motion_filter: default_filter(),
         }
     }
 }

@@ -689,6 +689,9 @@ impl App {
             self.ctx.clone(),
             f.main.clone(),
             self.prefs.playback_speed,
+            playback::Band::from_name(&self.prefs.event_band),
+            self.prefs.motion_filter.iter().any(|f| f == "human"),
+            self.prefs.motion_filter.iter().any(|f| f == "vehicle"),
         );
         // Default: a minute back.
         pb.begin(start_at.unwrap_or_else(|| chrono::Utc::now() - chrono::TimeDelta::seconds(60)));
@@ -731,6 +734,15 @@ impl App {
             return;
         };
         pb.poll();
+        if std::mem::take(&mut pb.band_dirty) {
+            self.prefs.event_band = pb.band.name().into();
+            self.prefs.motion_filter = [(pb.human, "human"), (pb.vehicle, "vehicle")]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, n)| n.to_string())
+                .collect();
+            self.prefs.save();
+        }
         let hud = pb.hud.take();
         // Every play/seek/pause refreshes the remembered position (crash
         // insurance; a clean quit records it exactly).
@@ -892,8 +904,10 @@ impl App {
         } else if self.focused.as_ref().is_some_and(Focused::zoomed) {
             self.focused.as_mut().unwrap().reset_zoom();
         } else if let Some(pb) = self.focused.as_mut().and_then(|f| f.playback.as_mut()) {
-            // Leave playback (stay focused); an open calendar closes first.
-            if pb.cal.open {
+            // Leave playback (stay focused); an open dialog closes first.
+            if pb.selector.is_some() {
+                pb.selector = None;
+            } else if pb.cal.open {
                 pb.cal.open = false;
             } else {
                 self.exit_playback();
@@ -914,6 +928,23 @@ impl App {
         let mut speed_changed = false;
         ui.input(|i| {
             use egui::Key;
+            // The selector owns the keyboard while up (Esc is handled by the
+            // app's escape chain).
+            if pb.selector.is_some() {
+                for e in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
+                        && *key != Key::Escape
+                    {
+                        pb.selector_key(*key, modifiers.shift);
+                    }
+                }
+                return;
+            }
             if pb.cal.open {
                 if i.key_pressed(Key::ArrowLeft) {
                     pb.move_calendar_cursor(-1);
@@ -976,6 +1007,16 @@ impl App {
             }
             if i.key_pressed(Key::T) {
                 pb.jump_to_today();
+            }
+            if i.key_pressed(Key::E) && !i.modifiers.shift {
+                pb.toggle_selector();
+            }
+            if i.key_pressed(Key::N) {
+                if i.modifiers.shift {
+                    pb.jump_to_previous_event();
+                } else {
+                    pb.jump_to_next_event();
+                }
             }
         });
         if speed_changed {

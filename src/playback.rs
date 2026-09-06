@@ -10,7 +10,7 @@
 // thread; here the fetches run on threads and `poll` (once per UI frame)
 // collects their results and runs what was waiting on them.
 
-use crate::nvr::{self, Client, Segment};
+use crate::nvr::{self, Client, EventLog, Segment};
 use crate::{rtsp, stream};
 use chrono::{DateTime, Datelike, Months, NaiveDate, TimeDelta, Utc};
 use eframe::egui;
@@ -51,6 +51,50 @@ struct Fetch {
 
 /// A month's recorded days on the way: (year, month) and the result.
 type MonthFetch = ((i32, u32), Receiver<HashSet<u32>>);
+
+/// Which event type the playback timeline highlights (the E selector).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Band {
+    None,
+    Motion,
+    Intrusion,
+}
+
+impl Band {
+    pub const ALL: [Band; 3] = [Band::None, Band::Motion, Band::Intrusion];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Band::None => "none",
+            Band::Motion => "motion",
+            Band::Intrusion => "intrusion",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Band {
+        match s {
+            "none" => Band::None,
+            "intrusion" => Band::Intrusion,
+            _ => Band::Motion,
+        }
+    }
+}
+
+/// The E dialog: transactional — ←→ move, ↑↓ switch rows, Space flips a
+/// toggle, Return applies everything and dismisses, Esc cancels. Clicking a
+/// band cell applies immediately (with the pending toggles).
+pub struct Selector {
+    pub band_cursor: usize,
+    pub on_filters: bool,
+    pub filter_cursor: usize,
+    pub human: bool,
+    pub vehicle: bool,
+    /// Counts of events intersecting the visible window; None while fetching.
+    pub motion_count: Option<usize>,
+    pub intrusion_count: Option<usize>,
+    counts: Option<(u32, Receiver<(Option<usize>, Option<usize>)>)>,
+    counts_token: u32,
+}
 
 /// Calendar popover state (MonthCalendarView + the controller's month cache).
 pub struct Calendar {
@@ -111,6 +155,23 @@ pub struct Playback {
     /// A message for the HUD.
     pub hud: Option<String>,
     pub strip_input: crate::timeline::StripInput,
+    /// Event highlights: the band and the motion filters (one global
+    /// choice shared across cameras, like speed). For motion, neither
+    /// filter on = all motion (alarm log); either on = only AcuSense-
+    /// classified human/vehicle motion. Intrusion = the camera's
+    /// fieldDetection events from the same alarm log.
+    pub band: Band,
+    pub human: bool,
+    pub vehicle: bool,
+    /// The band/filters changed — the app persists them.
+    pub band_dirty: bool,
+    /// What the timeline shows for the displayed day.
+    pub event_spans: Vec<Segment>,
+    pub events_loading: bool,
+    event_token: u32,
+    /// Spans on the way; may deliver twice (cached, then fresh).
+    event_rx: Option<(u32, Receiver<Vec<Segment>>)>,
+    pub selector: Option<Selector>,
 }
 
 impl Playback {
@@ -122,6 +183,9 @@ impl Playback {
         ctx: egui::Context,
         shown: Arc<stream::Shared>,
         speed: u32,
+        band: Band,
+        human: bool,
+        vehicle: bool,
     ) -> Self {
         let now = Utc::now();
         Playback {
@@ -155,6 +219,15 @@ impl Playback {
             transport: None,
             hud: None,
             strip_input: Default::default(),
+            band,
+            human,
+            vehicle,
+            band_dirty: false,
+            event_spans: Vec::new(),
+            events_loading: false,
+            event_token: 0,
+            event_rx: None,
+            selector: None,
         }
     }
 
@@ -200,6 +273,7 @@ impl Playback {
             }
         }
         self.poll_calendar();
+        self.poll_events();
 
         // A zoomed window slides forward to keep the playing cursor in view.
         let pos = self.position();
@@ -509,6 +583,283 @@ impl Playback {
             ctx.request_repaint();
         });
         self.fetch = Some(Fetch { day, rx, after });
+        self.refresh_events();
+        // Warm the day's event log now: the stitched crawl takes many
+        // seconds on a busy day, and starting it at playback-open (instead
+        // of when the selector or an intrusion switch first needs it) hides
+        // that latency. Concurrent calls share one crawl.
+        let (warm_tx, _) = channel();
+        self.client.event_log(day, end, warm_tx);
+    }
+
+    // MARK: event highlights (E selector: none / motion / intrusion)
+
+    fn channel(&self) -> u32 {
+        self.track / 100
+    }
+
+    /// Fetch the displayed day's spans for the current band on a thread.
+    /// The alarm log may answer twice (cached, then fresh); each answer is
+    /// forwarded, and a token drops results from a superseded request.
+    fn refresh_events(&mut self) {
+        self.event_token += 1;
+        let token = self.event_token;
+        let (tx, rx) = channel();
+        let client = self.client.clone();
+        let (day, end, ch) = (self.day, self.day_end(), self.channel());
+        let (band, human, vehicle) = (self.band, self.human, self.vehicle);
+        let ctx = self.ctx.clone();
+        self.events_loading = band != Band::None;
+        if band == Band::None {
+            self.event_spans.clear();
+            self.event_rx = None;
+            return;
+        }
+        std::thread::spawn(move || {
+            if band == Band::Motion && (human || vehicle) {
+                let mut union = Vec::new();
+                for t in [(human, "human"), (vehicle, "vehicle")] {
+                    if t.0 {
+                        union.extend(client.classified_spans(ch, day, end, t.1).iter().copied());
+                    }
+                }
+                let _ = tx.send(nvr::merge(union));
+                ctx.request_repaint();
+                return;
+            }
+            let (ltx, lrx) = channel();
+            client.event_log(day, end, ltx);
+            for log in lrx {
+                let spans = match band {
+                    Band::Intrusion => log.intrusion.get(&ch).cloned(),
+                    _ => log.motion.get(&ch).cloned(),
+                }
+                .unwrap_or_default();
+                if tx.send(spans).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+        self.event_rx = Some((token, rx));
+    }
+
+    fn poll_events(&mut self) {
+        if let Some((token, rx)) = &self.event_rx {
+            let mut latest = None;
+            let mut gone = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(spans) => latest = Some(spans),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        gone = true;
+                        break;
+                    }
+                }
+            }
+            if *token == self.event_token {
+                if let Some(spans) = latest {
+                    self.event_spans = spans;
+                    self.events_loading = false;
+                }
+            }
+            if gone {
+                self.event_rx = None;
+                self.events_loading = false;
+            }
+        }
+        if let Some(sel) = &mut self.selector
+            && let Some((token, rx)) = &sel.counts
+            && let Ok((motion, intrusion)) = rx.try_recv()
+        {
+            if *token == sel.counts_token {
+                if let Some(m) = motion {
+                    sel.motion_count = Some(m);
+                }
+                if let Some(i) = intrusion {
+                    sel.intrusion_count = Some(i);
+                }
+            }
+            sel.counts = None;
+        }
+    }
+
+    /// N: jump to the next event block after the current position — within
+    /// the displayed day only; past the day's last block a HUD says so.
+    pub fn jump_to_next_event(&mut self) {
+        if self.band == Band::None {
+            self.hud = Some("No events shown".into());
+            return;
+        }
+        let pos = self.position();
+        match self
+            .event_spans
+            .iter()
+            .find(|s| s.start > pos + TimeDelta::seconds(1))
+            .map(|s| s.start)
+        {
+            Some(t) => self.seek(t),
+            None => {
+                self.hud = Some(if self.events_loading {
+                    "Loading events…".into()
+                } else {
+                    format!("No more {}", self.band.name())
+                })
+            }
+        }
+    }
+
+    /// Shift-N: back to the previous event block (same day-bounded rules).
+    pub fn jump_to_previous_event(&mut self) {
+        if self.band == Band::None {
+            self.hud = Some("No events shown".into());
+            return;
+        }
+        let pos = self.position();
+        match self
+            .event_spans
+            .iter()
+            .rev()
+            .find(|s| s.start < pos - TimeDelta::seconds(1))
+            .map(|s| s.start)
+        {
+            Some(t) => self.seek(t),
+            None => {
+                self.hud = Some(if self.events_loading {
+                    "Loading events…".into()
+                } else {
+                    format!("No earlier {}", self.band.name())
+                })
+            }
+        }
+    }
+
+    pub fn toggle_selector(&mut self) {
+        if self.selector.is_some() {
+            self.selector = None;
+            return;
+        }
+        self.selector = Some(Selector {
+            band_cursor: Band::ALL.iter().position(|b| *b == self.band).unwrap_or(1),
+            on_filters: false,
+            filter_cursor: 0,
+            human: self.human,
+            vehicle: self.vehicle,
+            motion_count: None,
+            intrusion_count: None,
+            counts: None,
+            counts_token: 0,
+        });
+        self.fetch_counts();
+    }
+
+    /// Counts for the selector's cells: events intersecting the *visible*
+    /// timeline window. The motion count follows the dialog's pending
+    /// filter state.
+    pub fn fetch_counts(&mut self) {
+        let Some(sel) = &mut self.selector else {
+            return;
+        };
+        sel.counts_token += 1;
+        sel.motion_count = None;
+        sel.intrusion_count = None;
+        let token = sel.counts_token;
+        let (human, vehicle) = (sel.human, sel.vehicle);
+        let (tx, rx) = channel();
+        let client = self.client.clone();
+        let (day, end, ch) = (self.day, self.day_end(), self.channel());
+        let (lo, hi) = (self.win_start, self.win_end());
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let clipped =
+                |spans: &[Segment]| spans.iter().filter(|s| s.end > lo && s.start < hi).count();
+            let motion = if human || vehicle {
+                let mut union = Vec::new();
+                for t in [(human, "human"), (vehicle, "vehicle")] {
+                    if t.0 {
+                        union.extend(client.classified_spans(ch, day, end, t.1).iter().copied());
+                    }
+                }
+                Some(clipped(&nvr::merge(union)))
+            } else {
+                None
+            };
+            let (ltx, lrx) = channel();
+            client.event_log(day, end, ltx);
+            let mut last: Option<Arc<EventLog>> = None;
+            for log in lrx {
+                last = Some(log);
+            }
+            let (m, i) = match last {
+                Some(log) => (
+                    motion.or_else(|| Some(clipped(log.motion.get(&ch).map_or(&[][..], |v| v)))),
+                    Some(clipped(log.intrusion.get(&ch).map_or(&[][..], |v| v))),
+                ),
+                None => (motion, None),
+            };
+            let _ = tx.send((m, i));
+            ctx.request_repaint();
+        });
+        if let Some(sel) = &mut self.selector {
+            sel.counts = Some((token, rx));
+        }
+    }
+
+    /// Apply a band + filter choice (from the selector or a programmatic
+    /// switch); only a real change clears and refetches.
+    pub fn apply_events(&mut self, band: Band, human: bool, vehicle: bool) {
+        let changed = band != self.band || human != self.human || vehicle != self.vehicle;
+        self.band = band;
+        self.human = human;
+        self.vehicle = vehicle;
+        self.band_dirty = true;
+        self.selector = None;
+        if changed {
+            self.event_spans.clear();
+            self.refresh_events();
+        }
+    }
+
+    /// Keyboard on the open selector; true when the key was consumed.
+    pub fn selector_key(&mut self, key: egui::Key, shift: bool) -> bool {
+        let Some(sel) = &mut self.selector else {
+            return false;
+        };
+        let _ = shift;
+        match key {
+            egui::Key::ArrowLeft | egui::Key::ArrowRight => {
+                let d: isize = if key == egui::Key::ArrowLeft { -1 } else { 1 };
+                if sel.on_filters {
+                    sel.filter_cursor = (sel.filter_cursor as isize + d).clamp(0, 1) as usize;
+                } else {
+                    sel.band_cursor = (sel.band_cursor as isize + d).clamp(0, 2) as usize;
+                }
+            }
+            egui::Key::ArrowDown => {
+                if !sel.on_filters && Band::ALL[sel.band_cursor] == Band::Motion {
+                    sel.on_filters = true;
+                }
+            }
+            egui::Key::ArrowUp => sel.on_filters = false,
+            egui::Key::Space => {
+                if sel.on_filters {
+                    if sel.filter_cursor == 0 {
+                        sel.human = !sel.human;
+                    } else {
+                        sel.vehicle = !sel.vehicle;
+                    }
+                    self.fetch_counts();
+                }
+            }
+            egui::Key::Enter => {
+                let (band, human, vehicle) = (Band::ALL[sel.band_cursor], sel.human, sel.vehicle);
+                self.apply_events(band, human, vehicle);
+            }
+            egui::Key::Escape | egui::Key::E => self.selector = None,
+            _ => return false,
+        }
+        true
     }
 
     // MARK: calendar (recorded days per month via dailyDistribution)

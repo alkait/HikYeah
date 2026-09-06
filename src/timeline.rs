@@ -3,7 +3,7 @@
 // days only), a zoomable 24-hour timeline of recorded segments, a loading
 // spinner, the time readout, and the zoom and speed buttons.
 
-use crate::playback::{Playback, ZOOM_LEVELS};
+use crate::playback::{Band, Playback, ZOOM_LEVELS};
 use crate::tile;
 use chrono::{DateTime, TimeDelta, Utc};
 use eframe::egui;
@@ -12,6 +12,18 @@ pub const BAR_HEIGHT: f32 = 38.0;
 const STRIP_HEIGHT: f32 = 26.0;
 /// Recorded segments (same teal as the app icon) and the calendar chips.
 const TEAL: egui::Color32 = egui::Color32::from_rgb(41, 189, 204);
+pub const MOTION: egui::Color32 = egui::Color32::from_rgb(235, 51, 48);
+pub const INTRUSION: egui::Color32 = egui::Color32::from_rgb(255, 148, 0);
+
+impl Band {
+    pub fn color(self) -> egui::Color32 {
+        match self {
+            Band::None => egui::Color32::from_white_alpha(100),
+            Band::Motion => MOTION,
+            Band::Intrusion => INTRUSION,
+        }
+    }
+}
 
 /// Timeline scroll/pinch accumulators (a zoom step per ~25 px or 15%).
 #[derive(Default)]
@@ -99,7 +111,167 @@ impl Playback {
         if self.cal.open {
             self.show_calendar(ui.ctx(), date_button);
         }
+        if self.selector.is_some() {
+            self.show_selector(ui.ctx(), avail);
+        }
         speed_changed
+    }
+
+    // MARK: the E selector
+
+    /// Centered panel over the video (styled after the Mac's selector):
+    /// the band row with counts, the human/vehicle row that refines motion,
+    /// a keyboard hint. A click on the dimmed backdrop cancels.
+    fn show_selector(&mut self, ctx: &egui::Context, avail: egui::Rect) {
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("selector backdrop"),
+        ))
+        .rect_filled(avail, 0.0, egui::Color32::from_black_alpha(90));
+        let mut apply: Option<usize> = None;
+        let mut toggle: Option<usize> = None;
+        let Some(sel) = &self.selector else {
+            return;
+        };
+        let (band_cursor, on_filters, filter_cursor) =
+            (sel.band_cursor, sel.on_filters, sel.filter_cursor);
+        let pending = [sel.human, sel.vehicle];
+        let counts = [None, sel.motion_count, sel.intrusion_count];
+        let current = self.band;
+        let motion_cursored = on_filters || Band::ALL[band_cursor] == Band::Motion;
+        let chip = |ui: &mut egui::Ui,
+                    label: String,
+                    fill: egui::Color32,
+                    border: Option<(f32, egui::Color32)>,
+                    dim: bool|
+         -> egui::Response {
+            let text = egui::RichText::new(format!("  {label}  "))
+                .size(12.0)
+                .color(tile::WHITE.gamma_multiply(if dim { 0.4 } else { 1.0 }));
+            let mut b = egui::Button::new(text).fill(fill).corner_radius(6.0);
+            b = match border {
+                Some((w, c)) => b.stroke(egui::Stroke::new(w, c)),
+                None => b.stroke(egui::Stroke::NONE),
+            };
+            ui.add_sized(egui::vec2(ui.spacing().interact_size.x.max(90.0), 26.0), b)
+        };
+        let area = egui::Area::new(egui::Id::new("event selector"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 235))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin {
+                        left: 18,
+                        right: 18,
+                        top: 14,
+                        bottom: 12,
+                    })
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("Timeline events")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(tile::WHITE),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for (i, band) in Band::ALL.iter().enumerate() {
+                                    let label = match band {
+                                        Band::None => "None".to_string(),
+                                        Band::Motion => match counts[1] {
+                                            Some(n) => format!("Motion ({n})"),
+                                            None => "Motion".into(),
+                                        },
+                                        Band::Intrusion => match counts[2] {
+                                            Some(n) => format!("Intrusion ({n})"),
+                                            None => "Intrusion".into(),
+                                        },
+                                    };
+                                    let active = *band == current;
+                                    // Active band = filled chip in its color; the
+                                    // keyboard cursor = red ring on top, grid style.
+                                    let fill = if active {
+                                        band.color().gamma_multiply(0.35)
+                                    } else {
+                                        egui::Color32::from_white_alpha(20)
+                                    };
+                                    let cursored = !on_filters && i == band_cursor;
+                                    let border = if cursored {
+                                        Some((2.0, tile::CURSOR_RED))
+                                    } else if active {
+                                        Some((1.5, band.color()))
+                                    } else {
+                                        None
+                                    };
+                                    if chip(ui, label, fill, border, false).clicked() {
+                                        apply = Some(i);
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                            // Filters refine motion only: dimmed and inert unless
+                            // Motion is the cursored band.
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for (i, name) in ["🚶 Human", "🚗 Vehicle"].iter().enumerate() {
+                                    let on = pending[i];
+                                    let fill = if on {
+                                        MOTION.gamma_multiply(0.25)
+                                    } else {
+                                        egui::Color32::from_white_alpha(15)
+                                    };
+                                    let cursored = on_filters && i == filter_cursor;
+                                    let border = cursored.then_some((2.0, tile::CURSOR_RED));
+                                    let r = chip(
+                                        ui,
+                                        name.to_string(),
+                                        fill,
+                                        border,
+                                        !motion_cursored || !on,
+                                    );
+                                    if r.clicked() && motion_cursored {
+                                        toggle = Some(i);
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "←→ move · ↑↓ row · space toggle · ↵ apply · esc",
+                                )
+                                .size(10.0)
+                                .color(egui::Color32::from_gray(140)),
+                            );
+                        });
+                    });
+            });
+        if let Some(i) = apply {
+            let (h, v) = (pending[0], pending[1]);
+            self.apply_events(Band::ALL[i], h, v);
+            return;
+        }
+        if let Some(i) = toggle
+            && let Some(sel) = &mut self.selector
+        {
+            if i == 0 {
+                sel.human = !sel.human;
+            } else {
+                sel.vehicle = !sel.vehicle;
+            }
+            self.fetch_counts();
+            return;
+        }
+        // A click on the dimmed backdrop (outside the panel) cancels.
+        if ctx.input(|i| i.pointer.any_pressed())
+            && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+            && !area.response.rect.contains(p)
+        {
+            self.selector = None;
+        }
     }
 
     // MARK: the strip
@@ -159,6 +331,24 @@ impl Playback {
             );
             painter.rect_filled(r, 0.0, TEAL);
             seg_rects.push(r);
+        }
+        // Event highlights over the recorded band — motion (red) or
+        // intrusion (orange), whatever the event selector chose (E).
+        let event_color = self.band.color();
+        for m in &self.event_spans {
+            let x0 = self.x_for(rect, m.start).max(rect.min.x);
+            let x1 = self.x_for(rect, m.end).min(rect.max.x);
+            if x1 <= rect.min.x || x0 >= rect.max.x {
+                continue;
+            }
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, band.min.y),
+                    egui::pos2(x1.max(x0 + 1.0), band.max.y),
+                ),
+                0.0,
+                event_color,
+            );
         }
 
         // Tick times aligned to wall-clock boundaries in the NVR's timezone.
