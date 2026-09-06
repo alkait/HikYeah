@@ -203,15 +203,40 @@ impl NerdStats {
                 ],
             },
         );
-        // decode
+        // decode: the choice, then what this stream actually runs on —
+        // libavcodec falls back to software when the device refuses the
+        // profile, and VAAPI pictures either stay on the GPU (zero-copy)
+        // or are downloaded through system memory.
         let software = decode.starts_with("CPU");
+        let zero_copy = target
+            .shared
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|f| f.dma.is_some());
+        let mut segs = vec![seg(
+            format!("{decode}{}", if software { " ⚠" } else { "" }),
+            if software { AMBER } else { tile::WHITE },
+        )];
+        if st.frames > 0 {
+            if st.hardware {
+                segs.push(seg(
+                    if zero_copy {
+                        " · hardware · zero-copy"
+                    } else {
+                        " · hardware · download"
+                    },
+                    tile::DIM,
+                ));
+            } else if !software {
+                segs.push(seg(" · software fallback ⚠", AMBER));
+            }
+        }
         push(
             "decode",
-            "The decode device chosen in Settings. \"CPU (software)\" means the processor does the decompression — heavy for high-resolution HEVC and the usual cause of stutter; expect high app-side CPU below. Pick a hardware option there if the probe found one.",
-            vec![seg(
-                format!("{decode}{}", if software { " ⚠" } else { "" }),
-                if software { AMBER } else { tile::WHITE },
-            )],
+            "The decode device chosen in Settings, then what this stream actually runs on. \"CPU (software)\" means the processor does the decompression — heavy for high-resolution HEVC and the usual cause of stutter; expect high app-side CPU below. \"software fallback\" means the device refused this stream (unsupported profile) and the CPU took over. \"zero-copy\" means decoded pictures stay on the GPU; \"download\" means they pass through system memory first.",
+            segs,
         );
 
         // fps (5 s window of samples)
@@ -580,10 +605,18 @@ impl App {
             shared,
         };
         if let Some(events) = events {
-            let decode = if channel == crate::config::SUB_CHANNEL {
-                "CPU (software)"
-            } else {
-                self.prefs.decode_label()
+            // What this stream was started with (decode_for): substreams
+            // stay on the CPU unless zero-copy VAAPI is up, in which case
+            // every stream uses it regardless of the Settings choice.
+            let decode = match self
+                .decode_for(channel == crate::config::SUB_CHANNEL)
+                .hwaccel
+            {
+                None => "CPU (software)",
+                Some(hw) => crate::prefs::decode_options()
+                    .iter()
+                    .find(|o| o.hwaccel == Some(hw))
+                    .map_or(hw, |o| o.label),
             };
             let smooth = self.prefs.smooth_live;
             self.nerd.refresh(&target, decode, smooth, events);
