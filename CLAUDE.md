@@ -4,6 +4,7 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 
 ## Rules
 
+- **Smoothness and performance come first, in every decision.** Video must never stutter, the UI must never jump or resize under the user, and nothing may burn CPU, GPU or wake a sleeping GPU without a measured reason. Measure before and after (CPU per thread, iGPU busy/clock, package temperature, redraw rate) and keep the numbers in the commit message. A feature that costs smoothness or heat is not done.
 - Run `cargo fmt` and `cargo clippy` before every commit; keep the tree warning-free so new warnings stand out.
 - Minimal, clean, maintainable code. No speculative abstractions, no empty scaffolding — split modules only when a feature makes them grow.
 - Flat `src/`, one module per concern: `main.rs` is app state + the frame loop; views live in `grid.rs`, `focused.rs`, `settings.rs`, `overlay.rs`, `timeline.rs` (playback bar); video is `stream.rs` (pacing, publish) + `decode.rs` (libav) + `gpu.rs` (device, DMA-BUF import) + `render.rs`; playback is `nvr.rs` (ISAPI) + `rtsp.rs` (native RTSP → the in-process decoder) + `playback.rs` (transport). Single crate; no workspace.

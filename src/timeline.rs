@@ -55,8 +55,11 @@ impl Playback {
             self.cycle_zoom();
         }
         right.label(bar_text(&self.clock_label()));
+        // The spinner's slot is always there: a widget that comes and goes
+        // would shift the strip and the readout on every seek.
+        let (slot, _) = right.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
         if self.loading {
-            right.spinner();
+            egui::Spinner::new().size(14.0).paint_at(&right, slot);
         }
         let right_edge = right.min_rect().min.x;
 
