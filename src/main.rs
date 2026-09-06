@@ -689,9 +689,11 @@ impl App {
             self.ctx.clone(),
             f.main.clone(),
             self.prefs.playback_speed,
-            playback::Band::from_name(&self.prefs.event_band),
-            self.prefs.motion_filter.iter().any(|f| f == "human"),
-            self.prefs.motion_filter.iter().any(|f| f == "vehicle"),
+            playback::EventChoice {
+                band: playback::Band::from_name(&self.prefs.event_band),
+                human: self.prefs.motion_filter.iter().any(|f| f == "human"),
+                vehicle: self.prefs.motion_filter.iter().any(|f| f == "vehicle"),
+            },
         );
         // Default: a minute back.
         pb.begin(start_at.unwrap_or_else(|| chrono::Utc::now() - chrono::TimeDelta::seconds(60)));

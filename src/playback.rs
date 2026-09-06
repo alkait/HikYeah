@@ -80,6 +80,18 @@ impl Band {
     }
 }
 
+/// Visible-window event counts on the way: (token, motion, intrusion).
+type CountFetch = (u32, Receiver<(Option<usize>, Option<usize>)>);
+
+/// The band and its motion filters — one global choice shared across
+/// cameras, like speed.
+#[derive(Clone, Copy)]
+pub struct EventChoice {
+    pub band: Band,
+    pub human: bool,
+    pub vehicle: bool,
+}
+
 /// The E dialog: transactional — ←→ move, ↑↓ switch rows, Space flips a
 /// toggle, Return applies everything and dismisses, Esc cancels. Clicking a
 /// band cell applies immediately (with the pending toggles).
@@ -92,7 +104,7 @@ pub struct Selector {
     /// Counts of events intersecting the visible window; None while fetching.
     pub motion_count: Option<usize>,
     pub intrusion_count: Option<usize>,
-    counts: Option<(u32, Receiver<(Option<usize>, Option<usize>)>)>,
+    counts: Option<CountFetch>,
     counts_token: u32,
 }
 
@@ -175,6 +187,7 @@ pub struct Playback {
 }
 
 impl Playback {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Arc<Client>,
         track: u32,
@@ -183,9 +196,7 @@ impl Playback {
         ctx: egui::Context,
         shown: Arc<stream::Shared>,
         speed: u32,
-        band: Band,
-        human: bool,
-        vehicle: bool,
+        events: EventChoice,
     ) -> Self {
         let now = Utc::now();
         Playback {
@@ -219,9 +230,9 @@ impl Playback {
             transport: None,
             hud: None,
             strip_input: Default::default(),
-            band,
-            human,
-            vehicle,
+            band: events.band,
+            human: events.human,
+            vehicle: events.vehicle,
             band_dirty: false,
             event_spans: Vec::new(),
             events_loading: false,
@@ -658,11 +669,11 @@ impl Playback {
                     }
                 }
             }
-            if *token == self.event_token {
-                if let Some(spans) = latest {
-                    self.event_spans = spans;
-                    self.events_loading = false;
-                }
+            if *token == self.event_token
+                && let Some(spans) = latest
+            {
+                self.event_spans = spans;
+                self.events_loading = false;
             }
             if gone {
                 self.event_rx = None;
