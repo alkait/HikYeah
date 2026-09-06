@@ -160,6 +160,11 @@ impl App {
                     visible,
                     render::VideoCallback { id, shared, uv },
                 ));
+            if let Some(o) = &self.overlay
+                && o.host == cam.host
+            {
+                crate::zones::paint(ui.painter(), video, avail, o);
+            }
         } else if let Some((tex, cached)) = &cam.placeholder {
             tile::draw_placeholder(ui.painter(), avail, tex, *cached);
         }

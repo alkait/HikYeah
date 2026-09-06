@@ -304,6 +304,11 @@ impl App {
                                 uv: render::VideoCallback::FULL,
                             },
                         ));
+                    if let Some(o) = &self.overlay
+                        && o.host == cam.host
+                    {
+                        crate::zones::paint(ui.painter(), rect, cell, o);
+                    }
                     rect
                 }
                 (None, Some((tex, cached))) => {

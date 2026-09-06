@@ -32,6 +32,12 @@ pub struct Prefs {
     /// Where the panel was last dragged to (window points).
     #[serde(default)]
     pub nerd_pos: Option<[f32; 2]>,
+    /// Nerd-stats overlay boxes: draw the camera's motion areas / intrusion
+    /// zones on its video (display only).
+    #[serde(default)]
+    pub nerd_draw_motion: bool,
+    #[serde(default)]
+    pub nerd_draw_zones: bool,
     /// Folder for snapshots and clips; None = the desktop (media.rs).
     #[serde(default)]
     pub save_dir: Option<String>,
@@ -74,6 +80,8 @@ impl Default for Prefs {
             remember_last_view: true,
             nerd_stats: false,
             nerd_pos: None,
+            nerd_draw_motion: false,
+            nerd_draw_zones: false,
             save_dir: None,
             playback_speed: 1,
             event_band: default_band(),

@@ -4,7 +4,7 @@
 // panel is open, twice a second. Bitrate and GOP rows are absent: ffmpeg
 // hands us decoded frames, so the compressed stream never passes through.
 
-use crate::{App, stream, tile};
+use crate::{App, NvrState, stream, tile, zones};
 use eframe::egui;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,9 @@ pub struct NerdStats {
     last_refresh: Option<Instant>,
     /// Panel position seen last frame and whether it still needs saving.
     pos_dirty: bool,
+    /// The target camera's configured areas, for the draw boxes + overlay.
+    motion_regions: Vec<zones::Poly>,
+    intrusion_regions: Vec<zones::Poly>,
 }
 
 fn seg(text: impl Into<String>, color: egui::Color32) -> Seg {
@@ -55,6 +58,26 @@ fn seg(text: impl Into<String>, color: egui::Color32) -> Seg {
 
 fn dash() -> Vec<Seg> {
     vec![seg("—", tile::DIM)]
+}
+
+/// "on · 24/7 · 2 zones", "off", "…" while loading, "n/a" when the camera
+/// doesn't support the event or the config couldn't be read.
+fn event_row(state: zones::State, schedule: Option<&str>, detail: Option<&str>) -> Vec<Seg> {
+    match state {
+        zones::State::Loading => vec![seg("…", tile::DIM)],
+        zones::State::Unknown => vec![seg("n/a", tile::DIM)],
+        zones::State::Off => vec![seg("off", tile::DIM)],
+        zones::State::On => {
+            let mut segs = vec![
+                seg("on", tile::WHITE),
+                seg(format!(" · {}", schedule.unwrap_or("…")), tile::DIM),
+            ];
+            if let Some(d) = detail {
+                segs.push(seg(format!(" · {d}"), tile::DIM));
+            }
+            segs
+        }
+    }
 }
 
 fn ago(d: Duration) -> String {
@@ -120,7 +143,7 @@ pub struct Target<'a> {
 }
 
 impl NerdStats {
-    fn refresh(&mut self, target: &Target, decode: &str, smooth: bool) {
+    fn refresh(&mut self, target: &Target, decode: &str, smooth: bool, events: zones::Info) {
         let now = Instant::now();
         if self.target != Some(target.id) {
             self.target = Some(target.id);
@@ -408,6 +431,61 @@ impl NerdStats {
             },
         );
 
+        // EVENTS: motion / intrusion config via the NVR.
+        let (motion, intrusion) = match events {
+            zones::Info::NoNvr => (
+                vec![seg("no NVR in Settings (Ctrl-,)", tile::DIM)],
+                vec![seg("no NVR in Settings (Ctrl-,)", tile::DIM)],
+            ),
+            zones::Info::Connecting => (
+                vec![seg("contacting NVR…", tile::DIM)],
+                vec![seg("contacting NVR…", tile::DIM)],
+            ),
+            zones::Info::NotRecorded => (
+                vec![seg("not a channel on this NVR", tile::DIM)],
+                vec![seg("not a channel on this NVR", tile::DIM)],
+            ),
+            zones::Info::Ready(ev) => {
+                let zones = ev.intrusion_regions.len();
+                let mut detail = None;
+                if ev.intrusion == zones::State::On {
+                    let mut d = match zones {
+                        0 => "no zones".to_string(),
+                        1 => "1 zone".to_string(),
+                        n => format!("{n} zones"),
+                    };
+                    if let Some(t) = &ev.intrusion_targets {
+                        d.push_str(&format!(" · {t}"));
+                    }
+                    detail = Some(d);
+                }
+                self.motion_regions = ev.motion_regions;
+                self.intrusion_regions = ev.intrusion_regions;
+                (
+                    event_row(
+                        ev.motion,
+                        ev.motion_schedule.as_deref(),
+                        ev.motion_targets.as_deref(),
+                    ),
+                    event_row(
+                        ev.intrusion,
+                        ev.intrusion_schedule.as_deref(),
+                        detail.as_deref(),
+                    ),
+                )
+            }
+        };
+        push(
+            "motion",
+            "Motion detection as configured on the camera (read through the NVR, read-only): whether it's enabled and its arming schedule. Outside the armed window the camera still records but flags no motion events, so nothing shows on the playback motion bands there.",
+            motion,
+        );
+        push(
+            "intrusion",
+            "AcuSense intrusion (field detection) as configured on the camera: enabled state and arming schedule. The box below draws the configured zone polygons over this camera's video — display only, nothing is written to the camera or NVR.",
+            intrusion,
+        );
+
         self.rows = rows;
         self.last_refresh = Some(now);
     }
@@ -427,26 +505,66 @@ impl NerdStats {
 }
 
 impl App {
+    /// Camera event config comes through the NVR (its channel map resolves
+    /// camera host -> channel); reuse playback's client, creating it here
+    /// when the panel is opened before any playback.
+    fn event_info(&mut self, host: &str, ctx: &egui::Context) -> zones::Info {
+        let Some(nvr) = self.config.as_ref().and_then(|c| c.nvr.clone()) else {
+            return zones::Info::NoNvr;
+        };
+        self.ensure_nvr();
+        let ch = match &self.nvr {
+            NvrState::Ready(c) => c.channel_by_host.get(host).copied(),
+            _ => return zones::Info::Connecting,
+        };
+        match ch {
+            Some(ch) => zones::Info::Ready(self.zones.info(&nvr, ch, ctx)),
+            None => zones::Info::NotRecorded,
+        }
+    }
+
     pub fn show_nerd_stats(&mut self, ctx: &egui::Context) {
         if !self.prefs.nerd_stats {
+            self.overlay = None;
             return;
         }
         // Focused camera's main stream (its substream during playback, when
         // no main pipe runs — AppDelegate.nerdStatsTarget), else the grid's
         // cursor (or last cursor) tile's substream.
-        let (idx, shared, channel): (usize, &stream::Shared, &'static str) = match &self.focused {
-            Some(f) if f.playback.is_some() => {
-                (f.idx, &self.cams[f.idx].shared, crate::config::SUB_CHANNEL)
-            }
-            Some(f) => (f.idx, &f.main, crate::config::MAIN_CHANNEL),
+        let (idx, channel): (usize, &'static str) = match &self.focused {
+            Some(f) if f.playback.is_some() => (f.idx, crate::config::SUB_CHANNEL),
+            Some(f) => (f.idx, crate::config::MAIN_CHANNEL),
             None if !self.cams.is_empty() => {
                 let i = self
                     .key_sel
                     .map_or(self.last_key_sel, |(i, _)| i)
                     .min(self.cams.len() - 1);
-                (i, &self.cams[i].shared, crate::config::SUB_CHANNEL)
+                (i, crate::config::SUB_CHANNEL)
             }
             None => return,
+        };
+        let id = self.cams[idx].id
+            | if channel == crate::config::MAIN_CHANNEL {
+                crate::MAIN_BIT
+            } else {
+                0
+            };
+        let due = self
+            .nerd
+            .last_refresh
+            .is_none_or(|t| t.elapsed() >= REFRESH)
+            || self.nerd.target != Some(id);
+        // The event rows need `&mut self` (NVR client, config cache), so
+        // they are fetched before the stream is borrowed for the target.
+        let host = self.cams[idx].host.clone();
+        let events = if due {
+            Some(self.event_info(&host, ctx))
+        } else {
+            None
+        };
+        let shared: &stream::Shared = match &self.focused {
+            Some(f) if f.playback.is_none() => &f.main,
+            _ => &self.cams[idx].shared,
         };
         let cam = &self.cams[idx];
         let codec = self
@@ -455,30 +573,20 @@ impl App {
             .and_then(|c| c.cameras.iter().find(|c| c.host == cam.host))
             .map_or("", |c| c.codec_label());
         let target = Target {
-            id: cam.id
-                | if channel == crate::config::MAIN_CHANNEL {
-                    crate::MAIN_BIT
-                } else {
-                    0
-                },
+            id,
             name: &cam.name,
             codec,
             channel,
             shared,
         };
-        if self
-            .nerd
-            .last_refresh
-            .is_none_or(|t| t.elapsed() >= REFRESH)
-            || self.nerd.target != Some(target.id)
-        {
+        if let Some(events) = events {
             let decode = if channel == crate::config::SUB_CHANNEL {
                 "CPU (software)"
             } else {
                 self.prefs.decode_label()
             };
             let smooth = self.prefs.smooth_live;
-            self.nerd.refresh(&target, decode, smooth);
+            self.nerd.refresh(&target, decode, smooth, events);
         }
         ctx.request_repaint_after(REFRESH);
 
@@ -487,6 +595,12 @@ impl App {
             .nerd_pos
             .map_or(egui::pos2(20.0, 60.0), |p| egui::pos2(p[0], p[1]));
         let mut copy = false;
+        let (mut draw_motion, mut draw_zones) =
+            (self.prefs.nerd_draw_motion, self.prefs.nerd_draw_zones);
+        let (has_motion, has_zones) = (
+            !self.nerd.motion_regions.is_empty(),
+            !self.nerd.intrusion_regions.is_empty(),
+        );
         let resp = egui::Window::new("nerd stats")
             .title_bar(false)
             .resizable(false)
@@ -544,7 +658,53 @@ impl App {
                             ui.end_row();
                         }
                     });
+                ui.add_space(4.0);
+                for (flag, enabled, text, tip) in [
+                    (
+                        &mut draw_motion,
+                        has_motion,
+                        "draw motion areas on video",
+                        "Overlay this camera's configured motion detection areas on its video. Display only — nothing is sent to the camera.",
+                    ),
+                    (
+                        &mut draw_zones,
+                        has_zones,
+                        "draw intrusion zones on video",
+                        "Overlay this camera's configured intrusion zones on its video. Display only — nothing is sent to the camera.",
+                    ),
+                ] {
+                    ui.add_enabled(
+                        enabled,
+                        egui::Checkbox::new(
+                            flag,
+                            egui::RichText::new(text).size(10.0).monospace().color(tile::DIM),
+                        ),
+                    )
+                    .on_hover_text(tip);
+                }
             });
+        if draw_motion != self.prefs.nerd_draw_motion || draw_zones != self.prefs.nerd_draw_zones {
+            self.prefs.nerd_draw_motion = draw_motion;
+            self.prefs.nerd_draw_zones = draw_zones;
+            self.prefs.save();
+        }
+        // The overlay follows the panel's target and boxes; drawn by the
+        // grid tile / focused view whose camera it names.
+        let motion = if draw_motion && has_motion {
+            self.nerd.motion_regions.clone()
+        } else {
+            Vec::new()
+        };
+        let intrusion = if draw_zones && has_zones {
+            self.nerd.intrusion_regions.clone()
+        } else {
+            Vec::new()
+        };
+        self.overlay = (!motion.is_empty() || !intrusion.is_empty()).then(|| zones::Overlay {
+            host: host.clone(),
+            motion,
+            intrusion,
+        });
         if copy {
             ctx.copy_text(self.nerd.plain_text());
         }

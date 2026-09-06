@@ -36,6 +36,7 @@ mod stream;
 mod tile;
 mod timeline;
 mod update;
+mod zones;
 
 use eframe::egui;
 use std::sync::Arc;
@@ -241,6 +242,10 @@ pub struct App {
     pub bookmark_prompt: Option<bookmarks::Prompt>,
     pub bookmark_pane: Option<bookmarks::Pane>,
     pub event_pane: Option<events::Pane>,
+    /// Per-camera event config via the NVR (nerd stats) and the overlay it
+    /// puts on one camera's video while a draw box is ticked.
+    pub zones: zones::Store,
+    pub overlay: Option<zones::Overlay>,
     pub event_memo: events::Memo,
     pub seen: events::SeenStore,
     /// Warm today's + yesterday's event log once the NVR client lands
@@ -356,6 +361,8 @@ impl App {
             bookmark_prompt: None,
             bookmark_pane: None,
             event_pane: None,
+            zones: Default::default(),
+            overlay: None,
             event_memo: Default::default(),
             seen: events::SeenStore::load(),
             warm_events: false,
