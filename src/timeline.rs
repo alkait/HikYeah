@@ -415,6 +415,37 @@ impl Playback {
             );
         }
 
+        // Bookmark pins: amber line with a diamond head at the top of the band.
+        let amber = egui::Color32::from_rgb(255, 191, 51);
+        for b in &self.pins {
+            if *b < self.win_start || *b > win_end {
+                continue;
+            }
+            let bx = self
+                .x_for(rect, *b)
+                .clamp(rect.min.x + 1.0, rect.max.x - 1.0);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(bx - 0.75, band.min.y),
+                    egui::pos2(bx + 0.75, band.max.y),
+                ),
+                0.0,
+                amber.gamma_multiply(0.8),
+            );
+            let d = 3.5;
+            let top = band.min.y;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(bx, top),
+                    egui::pos2(bx + d, top + d),
+                    egui::pos2(bx, top + 2.0 * d),
+                    egui::pos2(bx - d, top + d),
+                ],
+                amber,
+                egui::Stroke::NONE,
+            ));
+        }
+
         // Interaction: scrubbing moves the cursor, release seeks.
         let resp = ui.interact(
             rect,
@@ -430,10 +461,22 @@ impl Playback {
             cursor = Some(t);
         }
         if resp.drag_stopped() || resp.clicked() {
-            let t = resp.interact_pointer_pos().map_or_else(
+            let px = resp.interact_pointer_pos().map(|p| p.x);
+            let mut t = px.map_or_else(
                 || self.strip_input.scrub.unwrap_or(self.win_start),
-                |p| self.date_at(rect, p.x),
+                |x| self.date_at(rect, x),
             );
+            // A release within a few pixels of a bookmark pin snaps onto it.
+            if let Some(x) = px
+                && let Some(near) = self.pins.iter().min_by(|a, b| {
+                    (self.x_for(rect, **a) - x)
+                        .abs()
+                        .total_cmp(&(self.x_for(rect, **b) - x).abs())
+                })
+                && (self.x_for(rect, *near) - x).abs() <= 4.0
+            {
+                t = *near;
+            }
             self.strip_input.scrub = None;
             self.seek(t);
         }

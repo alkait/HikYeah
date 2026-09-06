@@ -184,6 +184,10 @@ pub struct Playback {
     /// Spans on the way; may deliver twice (cached, then fresh).
     event_rx: Option<(u32, Receiver<Vec<Segment>>)>,
     pub selector: Option<Selector>,
+    /// Bookmarked moments within the displayed day (timeline pins), and
+    /// which (day, store version) they were computed for.
+    pub pins: Vec<DateTime<Utc>>,
+    pub pins_key: (i64, u64),
 }
 
 impl Playback {
@@ -239,6 +243,8 @@ impl Playback {
             event_token: 0,
             event_rx: None,
             selector: None,
+            pins: Vec::new(),
+            pins_key: (0, u64::MAX),
         }
     }
 

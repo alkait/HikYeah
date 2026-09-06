@@ -219,7 +219,12 @@ impl App {
         // Keyboard navigation: arrows drive the red cursor, Return focuses it,
         // inactivity clears it.
         let mut focus: Option<usize> = None;
-        if !self.settings.open && self.save_prompts.is_empty() && self.drag.is_none() {
+        if !self.settings.open
+            && self.save_prompts.is_empty()
+            && self.drag.is_none()
+            && self.bookmark_pane.is_none()
+            && self.bookmark_prompt.is_none()
+        {
             let arrows = ui.input(|i| {
                 [
                     (i.key_pressed(egui::Key::ArrowLeft), -1, 0),

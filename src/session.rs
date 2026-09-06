@@ -64,7 +64,7 @@ pub fn to_apple(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0 - APPLE_EPOCH
 }
 
-fn from_apple(s: f64) -> DateTime<Utc> {
+pub fn from_apple(s: f64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(((s + APPLE_EPOCH) * 1000.0) as i64).unwrap_or_default()
 }
 

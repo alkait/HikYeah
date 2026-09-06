@@ -13,6 +13,7 @@
 //   hikyeah <rtsp-url>     single explicit URL (no focus view, no editing)
 //   hikyeah --test         ffmpeg synthetic test pattern (no camera needed)
 
+mod bookmarks;
 mod config;
 mod decode;
 mod focused;
@@ -235,6 +236,9 @@ pub struct App {
     /// For background work that needs to wake the UI (recorder shutdown).
     ctx: egui::Context,
     pub nvr: NvrState,
+    pub bookmarks: bookmarks::Store,
+    pub bookmark_prompt: Option<bookmarks::Prompt>,
+    pub bookmark_pane: Option<bookmarks::Pane>,
     /// Zero-copy video is available (gpu.rs); decoders read it per frame.
     pub zero_copy: gpu::ZeroCopy,
     /// A P press waiting on the NVR client: (camera index, start position).
@@ -281,6 +285,21 @@ pub const MAIN_BIT: u64 = 1 << 32;
 pub const REPAINT_COALESCE: std::time::Duration = std::time::Duration::from_millis(16);
 pub const GRID_COALESCE: std::time::Duration = std::time::Duration::from_millis(40);
 
+/// The modifiers held when `key` was pressed this frame. Read off the press
+/// event rather than the frame-end modifier state so a chord delivered inside
+/// one frame (synthetic input, a fast Shift-tap) is still seen as a chord.
+fn chord(i: &egui::InputState, key: egui::Key) -> Option<egui::Modifiers> {
+    i.events.iter().find_map(|e| match e {
+        egui::Event::Key {
+            key: k,
+            pressed: true,
+            modifiers,
+            ..
+        } if *k == key => Some(*modifiers),
+        _ => None,
+    })
+}
+
 impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
@@ -326,6 +345,9 @@ impl App {
             media_rx,
             ctx: cc.egui_ctx.clone(),
             nvr: NvrState::Idle,
+            bookmarks: bookmarks::Store::load(),
+            bookmark_prompt: None,
+            bookmark_pane: None,
             zero_copy,
             pending_playback: None,
             top_bar: false,
@@ -502,6 +524,12 @@ impl App {
     }
 
     pub fn focus(&mut self, idx: usize, ctx: &egui::Context) {
+        self.focus_with(idx, ctx, true);
+    }
+
+    /// `restore`: bring back a remembered playback position (a fresh entry
+    /// from the grid); programmatic jumps (bookmarks) manage their own.
+    pub fn focus_with(&mut self, idx: usize, ctx: &egui::Context, restore: bool) {
         let Some(url) = self.cams[idx].main_url.clone() else {
             return;
         };
@@ -531,7 +559,8 @@ impl App {
         session::save(session::Location::Camera, Some(&host));
         // A camera view just opened fresh: if it was left in playback, bring
         // the position back (AppDelegate.restoreViewState).
-        if self.prefs.remember_last_view
+        if restore
+            && self.prefs.remember_last_view
             && let Some(st) = session::load().per_camera.get(&host)
             && st.mode == session::Mode::Playback
         {
@@ -736,6 +765,12 @@ impl App {
             return;
         };
         pb.poll();
+        // Amber pins: this camera's bookmarks within the displayed day.
+        let pins_key = (pb.day.timestamp(), self.bookmarks.version);
+        if pb.pins_key != pins_key {
+            pb.pins_key = pins_key;
+            pb.pins = self.bookmarks.pins(&host, pb.day, pb.day_end());
+        }
         if std::mem::take(&mut pb.band_dirty) {
             self.prefs.event_band = pb.band.name().into();
             self.prefs.motion_filter = [(pb.human, "human"), (pb.vehicle, "vehicle")]
@@ -899,6 +934,18 @@ impl App {
             self.settings.editor = None;
         } else if self.settings.open {
             self.settings.open = false;
+        } else if self.bookmark_prompt.is_some() {
+            self.bookmark_prompt = None;
+        } else if let Some(pane) = &mut self.bookmark_pane {
+            // Esc: a pending delete, then the filter, then the pane.
+            if pane.confirm.is_some() {
+                pane.confirm = None;
+            } else if !pane.filter.is_empty() {
+                pane.filter.clear();
+                pane.sel = None;
+            } else {
+                self.bookmark_pane = None;
+            }
         } else if self.drag.is_some() {
             self.cancel_drag();
         } else if self.key_sel.is_some() {
@@ -965,18 +1012,20 @@ impl App {
                 }
             } else {
                 // Arrow-key seek size: 10 s, Shift = 60 s, Ctrl = 15 min.
-                let skip = if i.modifiers.command || i.modifiers.ctrl {
-                    900
-                } else if i.modifiers.shift {
-                    60
-                } else {
-                    10
+                let skip = |m: egui::Modifiers| {
+                    if m.command || m.ctrl {
+                        900
+                    } else if m.shift {
+                        60
+                    } else {
+                        10
+                    }
                 };
-                if i.key_pressed(Key::ArrowLeft) {
-                    pb.step(-skip);
+                if let Some(m) = chord(i, Key::ArrowLeft) {
+                    pb.step(-skip(m));
                 }
-                if i.key_pressed(Key::ArrowRight) {
-                    pb.step(skip);
+                if let Some(m) = chord(i, Key::ArrowRight) {
+                    pb.step(skip(m));
                 }
                 // YouTube-style: 5 → 50% of the footage in view.
                 const DIGITS: [Key; 10] = [
@@ -1010,11 +1059,11 @@ impl App {
             if i.key_pressed(Key::T) {
                 pb.jump_to_today();
             }
-            if i.key_pressed(Key::E) && !i.modifiers.shift {
+            if chord(i, Key::E).is_some_and(|m| !m.shift) {
                 pb.toggle_selector();
             }
-            if i.key_pressed(Key::N) {
-                if i.modifiers.shift {
+            if let Some(m) = chord(i, Key::N) {
+                if m.shift {
                     pb.jump_to_previous_event();
                 } else {
                     pb.jump_to_next_event();
@@ -1162,7 +1211,14 @@ impl eframe::App for App {
 
         // The help sheet swallows the key or click that closes it; text
         // fields keep their keystrokes (a "?" in a password is a "?").
-        let typing = ctx.egui_wants_keyboard_input();
+        // The bookmark pane owns the keyboard while up (filter typing).
+        if self.bookmark_pane.is_some() {
+            let events = ui.input(|i| i.events.clone());
+            for e in &events {
+                self.bookmark_pane_key(e);
+            }
+        }
+        let typing = ctx.egui_wants_keyboard_input() || self.bookmark_pane.is_some();
         let help_was_open = self.help_open;
         if help_was_open {
             if ui.input(|i| {
@@ -1214,6 +1270,15 @@ impl eframe::App for App {
                 if ui.input(|i| i.key_pressed(egui::Key::P)) && self.focused.is_some() {
                     self.playback_key();
                 }
+                // Shift-B: the bookmark pane, from any context (plain B stays
+                // "add bookmark" in playback).
+                if let Some(m) = ui.input(|i| chord(i, egui::Key::B)) {
+                    if m.shift {
+                        self.toggle_bookmark_pane();
+                    } else if self.bookmark_prompt.is_none() {
+                        self.prompt_bookmark();
+                    }
+                }
                 self.playback_keys(ui);
             }
         }
@@ -1260,6 +1325,8 @@ impl eframe::App for App {
             self.show_grid(ui, avail);
         }
         self.show_nerd_stats(&ctx);
+        self.show_bookmark_prompt(&ctx);
+        self.show_bookmark_pane(&ctx);
         self.show_save_prompt(&ctx);
         self.show_top_bar(&ctx);
         self.show_update_banner(&ctx);
