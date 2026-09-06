@@ -7,13 +7,21 @@ main-stream view with digital zoom, and recorded playback straight from
 your NVR with a calendar, a 24-hour timeline and up to 4× speed.
 
 Pipeline: the FFmpeg libraries decode in-process (libavformat speaks RTSP,
-libavcodec decodes — on NVDEC, VAAPI, Quick Sync, … when chosen) and each
-picture lands directly in wgpu textures (I420 as three R8 planes, NV12 from a
-hardware decoder as R8 + RG8), converted to RGB in a WGSL shader during
-egui's render pass. Only the latest frame is ever shown, so latency can't
+libavcodec decodes). On Linux with an Intel iGPU rendering the window, every
+stream decodes on the iGPU's media engine via VAAPI and each surface is
+exported as a DMA-BUF and sampled by the shader as-is — **zero copies**, no
+CPU pixels, and a discrete GPU stays asleep (the VideoToolbox arrangement,
+with Linux primitives). Elsewhere the chosen decoder (NVDEC, VAAPI, Quick
+Sync, …, or the CPU) hands pictures to wgpu textures (I420 as three R8
+planes, NV12 as R8 + RG8), converted to RGB in a WGSL shader during egui's
+render pass. Only the latest frame is ever shown, so latency can't
 accumulate; a stream reconnects forever on exit or stall, like the Mac app.
 The `ffmpeg` binary is used only for clips, playback snapshots and the
 decoder probe.
+
+Measured on a 16-camera laptop (Intel iGPU + NVIDIA), whole app: grid 11%
+of one core, a 4K camera view 18%, 4× playback of a 4K stream 26% — down
+from 70%, 90% and 635% with the original ffmpeg-per-camera pipes.
 
 ## Install (Linux)
 
@@ -152,9 +160,11 @@ on macOS), "Smooth live video" (~0.2 s
 buffer absorbing Wi-Fi jitter; untick for minimum latency), the decode device
 (CPU, NVDEC, Quick Sync, VAAPI, … — only those that pass a startup probe are
 listed; it applies to the main stream and playback, while the grid's small
-substreams always decode on the CPU, where hardware decode was measured to
-cost more than it saves) and the render adapter (on a laptop, pick the
-integrated GPU to keep the discrete one asleep and its fan off).
+substreams decode on the CPU, where a hardware decode plus download was
+measured to cost more than it saves) and the render adapter. On a laptop
+with an Intel iGPU, pick the iGPU as the render adapter: every stream then
+takes the zero-copy VAAPI path regardless of the decode setting, and the
+discrete GPU stays asleep with its fan off.
 
 ## Not ported yet
 

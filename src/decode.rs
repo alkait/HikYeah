@@ -8,12 +8,15 @@
 //
 // Each stream runs on its own thread; nothing here touches the UI.
 
+use crate::gpu::DmaFrame;
 use crate::stream::{Decode, Pacer, PixFmt, STALL_TIMEOUT, Shared};
 use ffmpeg_next as ff;
 use ffmpeg_next::ffi as sys;
 use std::ffi::{CStr, CString, c_void};
 use std::io::Read;
+use std::os::fd::FromRawFd;
 use std::ptr;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -55,11 +58,7 @@ pub fn run_rtsp(
     // Socket timeout (µs): a dead host answers within this, not never.
     opts.set("timeout", "8000000");
     let ictx = open_with_interrupt(url, None, opts, sh)?;
-    let hw = match decode {
-        Decode::Substream | Decode::Preferred(None) => None,
-        Decode::Preferred(Some(name)) => Some(name),
-    };
-    let mut session = Session::open(ictx, hw, matches!(decode, Decode::Substream))?;
+    let mut session = Session::open(ictx, &decode)?;
     session.run(sh, Pacer::new(launch), true, wake)
 }
 
@@ -69,7 +68,7 @@ pub fn run_pipe(
     sh: &Arc<Shared>,
     rx: Receiver<Vec<u8>>,
     codec: &str,
-    hwaccel: Option<&'static str>,
+    decode: Decode,
     wake: &(impl Fn(Duration) + Send),
 ) -> Result<(), String> {
     init();
@@ -87,7 +86,7 @@ pub fn run_pipe(
     opts.set("probesize", "32");
     opts.set("analyzeduration", "0");
     let ictx = open_with_interrupt("", Some((codec, Some(io))), opts, sh)?;
-    let mut session = Session::open(ictx, hwaccel, false)?;
+    let mut session = Session::open(ictx, &decode)?;
     session.run(sh, Pacer::new(launch), false, wake)
 }
 
@@ -103,7 +102,14 @@ pub fn run_test(sh: &Arc<Shared>, wake: &(impl Fn(Duration) + Send)) -> Result<(
         ff::Dictionary::new(),
         sh,
     )?;
-    let mut session = Session::open(ictx, None, true)?;
+    let mut session = Session::open(
+        ictx,
+        &Decode {
+            hwaccel: None,
+            single_thread: true,
+            zero_copy: None,
+        },
+    )?;
     session.paced = Some(Duration::from_millis(40));
     session.run(sh, Pacer::new(launch), true, wake)
 }
@@ -204,6 +210,10 @@ impl Read for PipeReader {
 /// get_format through the context's opaque pointer.
 struct HwChoice {
     pix_fmt: sys::AVPixelFormat,
+    device: *mut sys::AVBufferRef,
+    /// Surfaces held beyond the decoder's own needs: the frame on screen,
+    /// the smoothing queue (≤ 8) and the renderer's in-flight guard.
+    extra_surfaces: i32,
 }
 
 unsafe extern "C" fn get_format(
@@ -211,12 +221,26 @@ unsafe extern "C" fn get_format(
     fmts: *const sys::AVPixelFormat,
 ) -> sys::AVPixelFormat {
     unsafe {
-        let want = ((*ctx).opaque as *const HwChoice)
-            .as_ref()
-            .map(|c| c.pix_fmt);
+        let Some(choice) = ((*ctx).opaque as *const HwChoice).as_ref() else {
+            return *fmts;
+        };
         let mut p = fmts;
         while *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
-            if Some(*p) == want {
+            if *p == choice.pix_fmt {
+                // Size the surface pool ourselves: libavcodec's default is
+                // just what decoding needs, and we hold frames longer.
+                let mut frames = ptr::null_mut();
+                if sys::avcodec_get_hw_frames_parameters(ctx, choice.device, *p, &raw mut frames)
+                    >= 0
+                {
+                    let fc = (*frames).data as *mut sys::AVHWFramesContext;
+                    (*fc).initial_pool_size += choice.extra_surfaces;
+                    if sys::av_hwframe_ctx_init(frames) >= 0 {
+                        (*ctx).hw_frames_ctx = frames;
+                    } else {
+                        sys::av_buffer_unref(&raw mut frames);
+                    }
+                }
                 return *p;
             }
             p = p.add(1);
@@ -242,14 +266,18 @@ struct Session {
     scaled: ff::frame::Video,
     /// Sleep this long per frame (the unpaced test source only).
     paced: Option<Duration>,
+    /// Zero-copy export (VAAPI → DRM PRIME): the flag, the derived DRM
+    /// device and the frames context derived from the decoder's pool.
+    zero_copy: Option<crate::gpu::ZeroCopy>,
+    drm_device: *mut sys::AVBufferRef,
+    drm_frames: *mut sys::AVBufferRef,
+    drm_frames_src: usize,
 }
 
 impl Session {
-    fn open(
-        ictx: ff::format::context::Input,
-        hwaccel: Option<&str>,
-        single_thread: bool,
-    ) -> Result<Session, String> {
+    fn open(ictx: ff::format::context::Input, decode: &Decode) -> Result<Session, String> {
+        let hwaccel = decode.hwaccel;
+        let single_thread = decode.single_thread;
         let stream = ictx
             .streams()
             .best(ff::media::Type::Video)
@@ -260,6 +288,12 @@ impl Session {
         let mut ctx = ff::codec::context::Context::new_with_codec(codec);
         ctx.set_parameters(params).map_err(|e| e.to_string())?;
         ctx.set_flags(ff::codec::Flags::LOW_DELAY);
+        // Hikvision door stations send H.264 "Baseline" that is really
+        // constrained baseline; without this the VAAPI driver refuses it
+        // (ffmpeg's -hwaccel_flags allow_profile_mismatch).
+        unsafe {
+            (*ctx.as_mut_ptr()).hwaccel_flags |= sys::AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
+        }
         if single_thread {
             ctx.set_threading(ff::codec::threading::Config::count(1));
         }
@@ -272,7 +306,11 @@ impl Session {
                 Some((device, fmt)) => {
                     hw_device = device;
                     hw_fmt = Some(fmt);
-                    let choice = Box::new(HwChoice { pix_fmt: fmt });
+                    let choice = Box::new(HwChoice {
+                        pix_fmt: fmt,
+                        device,
+                        extra_surfaces: 12,
+                    });
                     unsafe {
                         let raw = ctx.as_mut_ptr();
                         (*raw).hw_device_ctx = sys::av_buffer_ref(device);
@@ -301,6 +339,14 @@ impl Session {
             scaler: None,
             scaled: ff::frame::Video::empty(),
             paced: None,
+            zero_copy: if hwaccel == Some("vaapi") {
+                decode.zero_copy.clone()
+            } else {
+                None
+            },
+            drm_device: ptr::null_mut(),
+            drm_frames: ptr::null_mut(),
+            drm_frames_src: 0,
         })
     }
 
@@ -366,7 +412,36 @@ impl Session {
         wake: &(impl Fn(Duration) + Send),
     ) -> Result<(), String> {
         while self.decoder.receive_frame(&mut self.frame).is_ok() {
-            let src: &ff::frame::Video = if Some(self.frame.format().into()) == self.hw_fmt {
+            let is_hw = Some(self.frame.format().into()) == self.hw_fmt;
+            if is_hw
+                && self
+                    .zero_copy
+                    .as_ref()
+                    .is_some_and(|z| z.load(Ordering::Relaxed))
+            {
+                match self.export_dma() {
+                    Some(dma) => {
+                        let (w, h) = (dma.width as usize, dma.height as usize);
+                        pacer.publish(
+                            sh,
+                            Vec::new(),
+                            Some(Arc::new(dma)),
+                            w,
+                            h,
+                            PixFmt::Nv12,
+                            live,
+                            path,
+                            wake,
+                        );
+                        continue;
+                    }
+                    None => {
+                        // Can't export: this decoder downloads from here on.
+                        self.zero_copy = None;
+                    }
+                }
+            }
+            let src: &ff::frame::Video = if is_hw {
                 // Download from the GPU (NV12 on every hardware decoder here).
                 let ret = unsafe {
                     sys::av_frame_unref(self.sw_frame.as_mut_ptr());
@@ -419,10 +494,133 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Map the decoded VAAPI surface to a DRM PRIME descriptor (one
+    /// DMA-BUF, NV12 as two layers) and wrap it for the renderer. The mapped
+    /// frame keeps the surface referenced until the wrapper is dropped.
+    fn export_dma(&mut self) -> Option<DmaFrame> {
+        unsafe {
+            let src = self.frame.as_ptr();
+            let src_frames = (*src).hw_frames_ctx;
+            if src_frames.is_null() {
+                return None;
+            }
+            if self.drm_frames.is_null() || self.drm_frames_src != src_frames as usize {
+                if !self.drm_frames.is_null() {
+                    sys::av_buffer_unref(&raw mut self.drm_frames);
+                }
+                if self.drm_device.is_null()
+                    && sys::av_hwdevice_ctx_create_derived(
+                        &raw mut self.drm_device,
+                        sys::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
+                        self.hw_device,
+                        0,
+                    ) < 0
+                {
+                    debug("no DRM device could be derived from VAAPI");
+                    return None;
+                }
+                if sys::av_hwframe_ctx_create_derived(
+                    &raw mut self.drm_frames,
+                    sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME,
+                    self.drm_device,
+                    src_frames,
+                    sys::AV_HWFRAME_MAP_READ as i32,
+                ) < 0
+                {
+                    debug("VAAPI frames can't be mapped to DRM PRIME");
+                    return None;
+                }
+                self.drm_frames_src = src_frames as usize;
+            }
+            let mut dst = sys::av_frame_alloc();
+            (*dst).format = sys::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*dst).hw_frames_ctx = sys::av_buffer_ref(self.drm_frames);
+            if sys::av_hwframe_map(dst, src, sys::AV_HWFRAME_MAP_READ as i32) < 0 {
+                sys::av_frame_free(&raw mut dst);
+                debug("surface export failed");
+                return None;
+            }
+            let keep = Box::new(MappedFrame(dst));
+            let desc = &*((*dst).data[0] as *const sys::AVDRMFrameDescriptor);
+            // Two layers of one plane (VA_EXPORT_SURFACE_SEPARATE_LAYERS) or
+            // one NV12 layer of two planes — either way, two planes in order.
+            let mut planes: Vec<(u64, u64)> = Vec::with_capacity(2);
+            let mut object = None;
+            for l in 0..desc.nb_layers as usize {
+                let layer = &desc.layers[l];
+                for p in 0..layer.nb_planes as usize {
+                    let plane = &layer.planes[p];
+                    match object {
+                        None => object = Some(plane.object_index),
+                        Some(o) if o != plane.object_index => {
+                            debug("surface spans several buffers");
+                            return None;
+                        }
+                        _ => {}
+                    }
+                    planes.push((plane.offset as u64, plane.pitch as u64));
+                }
+            }
+            let (Some(object), true) = (object, planes.len() == 2) else {
+                debug("unexpected DRM layout");
+                return None;
+            };
+            let obj = &desc.objects[object as usize];
+            let dup = libc::dup(obj.fd);
+            if dup < 0 {
+                return None;
+            }
+            let fd = std::os::fd::OwnedFd::from_raw_fd(dup);
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(obj.fd, &raw mut st) != 0 {
+                return None;
+            }
+            Some(DmaFrame {
+                fd,
+                ino: st.st_ino,
+                modifier: obj.format_modifier,
+                width: (*dst).width as u32,
+                height: (*dst).height as u32,
+                planes: [planes[0], planes[1]],
+                keep,
+            })
+        }
+    }
+}
+
+/// A mapped DRM PRIME frame; unmapping it releases the decoder's surface.
+struct MappedFrame(*mut sys::AVFrame);
+
+// The pointer is only ever freed here, and libavutil's refcounting is
+// thread-safe, so the wrapper may travel between threads.
+unsafe impl Send for MappedFrame {}
+unsafe impl Sync for MappedFrame {}
+
+impl Drop for MappedFrame {
+    fn drop(&mut self) {
+        unsafe { sys::av_frame_free(&raw mut self.0) };
+    }
+}
+
+fn debug(msg: &str) {
+    if std::env::var_os("HIK_DEBUG").is_some() {
+        eprintln!("[decode] {msg}");
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
-        if !self.hw_device.is_null() {
-            unsafe { sys::av_buffer_unref(&raw mut self.hw_device) };
+        unsafe {
+            if !self.drm_frames.is_null() {
+                sys::av_buffer_unref(&raw mut self.drm_frames);
+            }
+            if !self.drm_device.is_null() {
+                sys::av_buffer_unref(&raw mut self.drm_device);
+            }
+            if !self.hw_device.is_null() {
+                sys::av_buffer_unref(&raw mut self.hw_device);
+            }
         }
     }
 }
@@ -459,7 +657,7 @@ fn publish(
         }
         out += row * rows;
     }
-    pacer.publish(sh, data, w, h, fmt, live, path, wake);
+    pacer.publish(sh, data, None, w, h, fmt, live, path, wake);
 }
 
 /// Open the named hardware device (ffmpeg's -hwaccel names: cuda, vaapi,
@@ -483,25 +681,44 @@ fn create_hw_device(
         })
         .map(|cfg| cfg.pix_fmt)?;
     let mut device: *mut sys::AVBufferRef = ptr::null_mut();
-    let mut opts = ff::Dictionary::new();
-    let mut node: Option<CString> = None;
-    if kind == sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+    let ret = if kind == sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
         && let Some(path) = intel_render_node()
+        && let Ok(node) = CString::new(path)
     {
-        node = CString::new(path).ok();
-        opts.set("driver", "iHD");
-    }
-    let mut dict = unsafe { opts.disown() };
-    let ret = unsafe {
-        sys::av_hwdevice_ctx_create(
-            &raw mut device,
-            kind,
-            node.as_ref().map_or(ptr::null(), |n| n.as_ptr()),
-            dict,
-            0,
-        )
+        // Open the DRM node first and derive VAAPI from it (what the CLI's
+        // `-init_hw_device drm=dr -init_hw_device vaapi=va@dr` does): the
+        // decoder's surfaces can then be mapped back to DRM PRIME for the
+        // zero-copy path, which only works through a DRM-derived device.
+        let mut drm: *mut sys::AVBufferRef = ptr::null_mut();
+        let ret = unsafe {
+            sys::av_hwdevice_ctx_create(
+                &raw mut drm,
+                sys::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
+                node.as_ptr(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if ret < 0 {
+            ret
+        } else {
+            let mut opts = ff::Dictionary::new();
+            opts.set("driver", "iHD");
+            let mut dict = unsafe { opts.disown() };
+            let ret = unsafe {
+                sys::av_hwdevice_ctx_create_derived_opts(&raw mut device, kind, drm, dict, 0)
+            };
+            unsafe {
+                sys::av_dict_free(&raw mut dict);
+                sys::av_buffer_unref(&raw mut drm); // the VAAPI device keeps its own ref
+            }
+            ret
+        }
+    } else {
+        unsafe {
+            sys::av_hwdevice_ctx_create(&raw mut device, kind, ptr::null(), ptr::null_mut(), 0)
+        }
     };
-    unsafe { sys::av_dict_free(&raw mut dict) };
     if ret < 0 || device.is_null() {
         if std::env::var_os("HIK_DEBUG").is_some() {
             eprintln!("[decode] {name} device: {}", ff::Error::from(ret));
@@ -521,7 +738,7 @@ fn create_hw_device(
 
 /// The first Intel render node (/dev/dri/renderD*), for VAAPI on hybrid
 /// laptops where the default would be the discrete GPU.
-fn intel_render_node() -> Option<String> {
+pub fn intel_render_node() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")

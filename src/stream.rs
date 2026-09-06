@@ -51,7 +51,10 @@ pub struct Frame {
     pub height: usize,
     pub format: PixFmt,
     /// Planes packed back to back (render.rs uploads them as textures).
+    /// Empty when the picture lives on the GPU (`dma`).
     pub data: Vec<u8>,
+    /// Zero-copy: the decoded surface itself, as a DMA-BUF (NV12).
+    pub dma: Option<Arc<crate::gpu::DmaFrame>>,
     pub seq: u64,
     /// When to present (arrival time when smoothing is off).
     pub due: Instant,
@@ -199,8 +202,14 @@ impl Shared {
             let mut q = self.queue.lock().unwrap();
             q.push_back(frame);
             // Bound the schedule (~1.5 s at 20 fps); a deeper backlog means
-            // the UI isn't consuming — drop from the front.
-            while q.len() > 30 {
+            // the UI isn't consuming — drop from the front. GPU-resident
+            // frames hold decoder surfaces from a fixed pool, so fewer.
+            let cap = if q.back().is_some_and(|f| f.dma.is_some()) {
+                8
+            } else {
+                30
+            };
+            while q.len() > cap {
                 overflow.push(q.pop_front().unwrap());
             }
         }
@@ -226,18 +235,19 @@ pub fn ffmpeg_path() -> std::path::PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
-/// Which decoder a live stream gets.
-#[derive(Clone, Copy)]
-pub enum Decode {
-    /// Single-thread software decode: the grid's small substreams. Measured
-    /// against NVDEC with sixteen 704×576 streams on a hybrid laptop:
-    /// hardware decode cost *more* CPU (the per-frame GPU→CPU download),
-    /// kept the discrete GPU clocked up (+4 W, its fan on), and frame
-    /// threads only add latency at this size.
-    Substream,
-    /// The user's decode choice (Settings): main stream and playback, where
-    /// a 4K stream is real work.
-    Preferred(Option<&'static str>),
+/// Which decoder a stream gets.
+#[derive(Clone)]
+pub struct Decode {
+    /// ffmpeg's -hwaccel name (cuda, vaapi, …); None = software.
+    pub hwaccel: Option<&'static str>,
+    /// One decoder thread: the grid's small substreams on the CPU, where
+    /// frame threads only add latency. (Measured against NVDEC with sixteen
+    /// 704×576 streams: hardware decode with a download cost *more* CPU
+    /// and kept the discrete GPU clocked up.)
+    pub single_thread: bool,
+    /// Export VAAPI surfaces as DMA-BUFs for the renderer (gpu.rs) while the
+    /// flag holds; a failed import flips it and frames get downloaded.
+    pub zero_copy: Option<crate::gpu::ZeroCopy>,
 }
 
 /// Per-session frame clock (port of VideoStreamParser.swift's smoothing):
@@ -281,6 +291,7 @@ impl Pacer {
         &mut self,
         sh: &Shared,
         data: Vec<u8>,
+        dma: Option<Arc<crate::gpu::DmaFrame>>,
         width: usize,
         height: usize,
         format: PixFmt,
@@ -289,6 +300,7 @@ impl Pacer {
         wake: &(impl Fn(Duration) + Send),
     ) {
         self.seq += 1;
+        let zero_copy = dma.is_some();
         // Burst arrivals (gap ≈ 0) are real data — the mean of the gaps is
         // the true frame interval. Cap only stall outliers.
         let now = self.epoch.elapsed().as_secs_f64();
@@ -330,6 +342,7 @@ impl Pacer {
             height,
             format,
             data,
+            dma,
             seq: self.seq,
             due,
         });
@@ -341,6 +354,14 @@ impl Pacer {
                 st.status = format!("{width}×{height}");
                 st.first_frame_secs = Some(self.launch.elapsed().as_secs_f32());
                 st.hardware = path == crate::decode::Path::Hardware;
+                if std::env::var_os("HIK_DEBUG").is_some() {
+                    eprintln!(
+                        "[stream] first frame after {:.2} s ({width}×{height}, {:?}{})",
+                        self.launch.elapsed().as_secs_f32(),
+                        format,
+                        if zero_copy { ", zero-copy" } else { "" }
+                    );
+                }
             }
             st.frames += 1;
             if reanchored {
@@ -408,7 +429,7 @@ pub fn start(
                 let result = if url == "--test" {
                     crate::decode::run_test(&sh, &wake)
                 } else {
-                    crate::decode::run_rtsp(&sh, &url, decode, &wake)
+                    crate::decode::run_rtsp(&sh, &url, decode.clone(), &wake)
                 };
                 if let Err(e) = &result {
                     if e == "stalled" {
@@ -464,7 +485,7 @@ impl Write for PipeSink {
 /// NVR paces playback (VideoStreamParser: "playback never smooths").
 pub fn start_pipe(
     codec: &'static str,
-    hwaccel: Option<&'static str>,
+    decode: Decode,
     coalesce: Duration,
     wake: impl Fn(Duration) + Send + 'static,
 ) -> (Arc<Shared>, PipeSink) {
@@ -478,7 +499,7 @@ pub fn start_pipe(
     thread
         .spawn(move || {
             sh.stats.lock().unwrap().tid = thread_id();
-            if let Err(e) = crate::decode::run_pipe(&sh, rx, codec, hwaccel, &wake)
+            if let Err(e) = crate::decode::run_pipe(&sh, rx, codec, decode, &wake)
                 && !sh.stopped()
                 && std::env::var_os("HIK_DEBUG").is_some()
             {

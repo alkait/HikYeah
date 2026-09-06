@@ -79,7 +79,7 @@ pub struct Playback {
     pub client: Arc<Client>,
     pub track: u32,
     codec: &'static str,
-    hwaccel: Option<&'static str>,
+    decode: stream::Decode,
     ctx: egui::Context,
     /// What the view draws: the running pipe once it has a frame, else the
     /// previous one frozen on its last frame (the Mac's display layer keeps
@@ -118,7 +118,7 @@ impl Playback {
         client: Arc<Client>,
         track: u32,
         codec: &'static str,
-        hwaccel: Option<&'static str>,
+        decode: stream::Decode,
         ctx: egui::Context,
         shown: Arc<stream::Shared>,
         speed: u32,
@@ -136,7 +136,7 @@ impl Playback {
             client,
             track,
             codec,
-            hwaccel,
+            decode,
             ctx,
             shown,
             stream: None,
@@ -416,7 +416,7 @@ impl Playback {
         let ctx = self.ctx.clone();
         let (shared, sink) = stream::start_pipe(
             self.codec,
-            self.hwaccel,
+            self.decode.clone(),
             crate::REPAINT_COALESCE,
             move |d| ctx.request_repaint_after(d),
         );

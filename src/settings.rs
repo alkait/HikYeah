@@ -329,7 +329,11 @@ impl App {
                             }
                         });
                 });
-                ui.small("Decode applies to the main stream and playback; grid substreams always use the CPU. Render changes take effect after restart — on a laptop, the integrated GPU keeps the discrete one asleep.");
+                ui.small(if self.zero_copy.load(std::sync::atomic::Ordering::Relaxed) {
+                    "Zero-copy: every stream decodes on the Intel iGPU and is shown without a copy; the Decode choice is not needed. Render changes take effect after restart."
+                } else {
+                    "Decode applies to the main stream and playback; grid substreams use the CPU. Render changes take effect after restart — on a laptop, the Intel iGPU enables zero-copy video and keeps the discrete GPU asleep."
+                });
                 ui.separator();
 
                 ui.horizontal(|ui| {

@@ -6,7 +6,7 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 
 - Run `cargo fmt` and `cargo clippy` before every commit; keep the tree warning-free so new warnings stand out.
 - Minimal, clean, maintainable code. No speculative abstractions, no empty scaffolding — split modules only when a feature makes them grow.
-- Flat `src/`, one module per concern: `main.rs` is app state + the frame loop; views live in `grid.rs`, `focused.rs`, `settings.rs`, `overlay.rs`, `timeline.rs` (playback bar); playback is `nvr.rs` (ISAPI) + `rtsp.rs` (native RTSP → the in-process decoder) + `playback.rs` (transport). Single crate; no workspace.
+- Flat `src/`, one module per concern: `main.rs` is app state + the frame loop; views live in `grid.rs`, `focused.rs`, `settings.rs`, `overlay.rs`, `timeline.rs` (playback bar); video is `stream.rs` (pacing, publish) + `decode.rs` (libav) + `gpu.rs` (device, DMA-BUF import) + `render.rs`; playback is `nvr.rs` (ISAPI) + `rtsp.rs` (native RTSP → the in-process decoder) + `playback.rs` (transport). Single crate; no workspace.
 - Port logic from the Mac sources as written — the quirks (fake-`Z` NVR-local timestamps, 2000-entry log cap, `searchResultPostion`, no-qop RTSP digest, pause = kill the pipe and keep the frame) are intentional, measured findings; don't re-derive or "fix" them.
 - Threads + channels + `Mutex` — no async runtime.
 - Prefer serde enums over stringly-typed state (e.g. session location, pref ids) when touching those files.
@@ -15,5 +15,5 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 - Comments explain constraints and Mac-app ports (why), not what the code does.
 - Guard platform-specific code with `cfg(target_os)`; only Linux is exercised today, so double-check macOS/Windows paths compile.
 - Releases bundle ffmpeg pinned to a major branch (BtbN `n8.1-latest`): patches flow in automatically, majors bump only when the user asks. The macOS source is knowingly unpinned until there are Mac users. The app links the FFmpeg *libraries* (libavcodec/libavformat/libavutil/libswscale/libavdevice via pkg-config at build time); release archives must ship matching shared libraries next to the binary.
-- Every decoded pixel is cost: measured on a hybrid laptop, the old child-process pipe (raw frames through stdout, a conversion, a re-upload) was 4–5× the CPU of in-process decode. Keep frames on the fewest copies possible; the target is hardware decode straight into GPU memory (VAAPI DMA-BUF on Linux).
+- Every decoded pixel is cost: measured on a hybrid laptop, the old child-process pipe (raw frames through stdout, a conversion, a re-upload) was 4–5× the CPU of in-process decode, and a hardware decode *with a download* costs more CPU than software at small sizes. The zero-copy path (`gpu.rs`: VAAPI surfaces exported as DMA-BUFs, imported as Vulkan images on the Intel iGPU) is the model for other platforms: D3D11 shared textures on Windows, CVPixelBuffer/IOSurface on macOS. Never add a copy to a path that has none.
 - No tests for now.

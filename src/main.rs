@@ -16,6 +16,7 @@
 mod config;
 mod decode;
 mod focused;
+mod gpu;
 mod grid;
 mod isapi;
 mod media;
@@ -46,6 +47,12 @@ fn main() -> eframe::Result {
     if std::env::var_os("HIK_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some() {
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
     }
+    // libva picks its driver from LIBVA_DRIVER_NAME, which desktops set for
+    // their GPU (here: nvidia); our VAAPI decoding targets the Intel iGPU.
+    // Process-local, and only when there is an Intel node to target.
+    if decode::intel_render_node().is_some() {
+        unsafe { std::env::set_var("LIBVA_DRIVER_NAME", "iHD") };
+    }
     let arg = std::env::args().nth(1);
     let source = match arg.as_deref() {
         Some("--test") => Source::Single("test pattern".into(), "--test".into()),
@@ -73,48 +80,64 @@ fn main() -> eframe::Result {
     stream::SMOOTH.store(app_prefs.smooth_live, std::sync::atomic::Ordering::Relaxed);
     prefs::start_probe();
 
-    // Render adapter: pick the user's choice by name, else wgpu's first.
-    // The selector also records what exists for the Settings dropdown.
+    // Render adapter: the user's choice by name, else the first. On Linux
+    // the device is made by gpu.rs, which adds DMA-BUF import when the
+    // adapter is the Intel iGPU (zero-copy video); anywhere that fails,
+    // eframe's own setup with the same adapter policy.
     let want = app_prefs.render_adapter.clone();
-    let selector: eframe::egui_wgpu::NativeAdapterSelectorMethod =
-        Arc::new(move |adapters, surface| {
-            let usable: Vec<&eframe::wgpu::Adapter> = adapters
-                .iter()
-                .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
-                .collect();
-            let mut names: Vec<String> = Vec::new();
-            for a in &usable {
-                let n = a.get_info().name;
-                if !names.contains(&n) {
-                    names.push(n);
-                }
-            }
+    let zero_copy: gpu::ZeroCopy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wgpu_setup = match gpu::create(want.as_deref()) {
+        Ok(setup) => {
             if std::env::var_os("HIK_DEBUG").is_some() {
-                eprintln!("[render] adapters: {names:?}, wanted {want:?}");
+                eprintln!(
+                    "[render] adapters: {:?}, using {:?}, zero-copy {}",
+                    setup.adapter_names,
+                    setup.existing.adapter.get_info().name,
+                    setup.zero_copy
+                );
             }
-            render::set_adapter_names(names);
-            let pick = want
-                .as_ref()
-                .and_then(|w| usable.iter().find(|a| &a.get_info().name == w))
-                .or_else(|| usable.first())
-                .ok_or("no usable graphics adapter")?;
+            render::set_adapter_names(setup.adapter_names);
+            zero_copy.store(setup.zero_copy, std::sync::atomic::Ordering::Relaxed);
+            eframe::egui_wgpu::WgpuSetup::Existing(setup.existing)
+        }
+        Err(e) => {
             if std::env::var_os("HIK_DEBUG").is_some() {
-                eprintln!("[render] using {:?}", pick.get_info());
+                eprintln!("[render] {e} — eframe's default device");
             }
-            Ok((*pick).clone())
-        });
+            let selector: eframe::egui_wgpu::NativeAdapterSelectorMethod =
+                Arc::new(move |adapters, surface| {
+                    let usable: Vec<&eframe::wgpu::Adapter> = adapters
+                        .iter()
+                        .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+                        .collect();
+                    let mut names: Vec<String> = Vec::new();
+                    for a in &usable {
+                        let n = a.get_info().name;
+                        if !names.contains(&n) {
+                            names.push(n);
+                        }
+                    }
+                    render::set_adapter_names(names);
+                    let pick = want
+                        .as_ref()
+                        .and_then(|w| usable.iter().find(|a| &a.get_info().name == w))
+                        .or_else(|| usable.first())
+                        .ok_or("no usable graphics adapter")?;
+                    Ok((*pick).clone())
+                });
+            eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
+                native_adapter_selector: Some(selector),
+                ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+            })
+        }
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 810.0])
             .with_fullscreen(app_prefs.start_fullscreen && configured),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
-                eframe::egui_wgpu::WgpuSetupCreateNew {
-                    native_adapter_selector: Some(selector),
-                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
-                },
-            ),
+            wgpu_setup,
             ..Default::default()
         },
         ..Default::default()
@@ -122,7 +145,15 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "HikYeah",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, source, app_prefs, instance_lock)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(
+                cc,
+                source,
+                app_prefs,
+                instance_lock,
+                zero_copy,
+            )))
+        }),
     )
 }
 
@@ -204,6 +235,8 @@ pub struct App {
     /// For background work that needs to wake the UI (recorder shutdown).
     ctx: egui::Context,
     pub nvr: NvrState,
+    /// Zero-copy video is available (gpu.rs); decoders read it per frame.
+    pub zero_copy: gpu::ZeroCopy,
     /// A P press waiting on the NVR client: (camera index, start position).
     pending_playback: Option<(usize, Option<chrono::DateTime<chrono::Utc>>)>,
     /// The auto-hiding top bar is out (pointer at the top edge or on it).
@@ -254,12 +287,17 @@ impl App {
         source: Source,
         app_prefs: prefs::Prefs,
         instance_lock: Option<std::fs::File>,
+        zero_copy: gpu::ZeroCopy,
     ) -> Self {
         let rs = cc.wgpu_render_state.as_ref().expect("wgpu render state");
         rs.renderer
             .write()
             .callback_resources
-            .insert(render::VideoRenderer::new(&rs.device, rs.target_format));
+            .insert(render::VideoRenderer::new(
+                &rs.device,
+                rs.target_format,
+                zero_copy.clone(),
+            ));
         let (snap_tx, snap_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         let (media_tx, media_rx) = std::sync::mpsc::channel();
@@ -288,6 +326,7 @@ impl App {
             media_rx,
             ctx: cc.egui_ctx.clone(),
             nvr: NvrState::Idle,
+            zero_copy,
             pending_playback: None,
             top_bar: false,
             hud: None,
@@ -400,18 +439,39 @@ impl App {
         self.start_streams(ctx);
     }
 
+    /// The decoder for a substream or a main/playback stream. With
+    /// zero-copy available every stream goes to the iGPU's media engine and
+    /// stays there; otherwise substreams decode on the CPU (measured cheaper
+    /// than a hardware decode plus download at their size) and the Settings
+    /// choice applies to main streams and playback.
+    pub fn decode_for(&self, substream: bool) -> stream::Decode {
+        if self.zero_copy.load(std::sync::atomic::Ordering::Relaxed) {
+            return stream::Decode {
+                hwaccel: Some("vaapi"),
+                single_thread: false,
+                zero_copy: Some(self.zero_copy.clone()),
+            };
+        }
+        stream::Decode {
+            hwaccel: if substream {
+                None
+            } else {
+                self.prefs.hwaccel()
+            },
+            single_thread: substream,
+            zero_copy: None,
+        }
+    }
+
     fn start_streams(&mut self, ctx: &egui::Context) {
-        // Substreams always decode on the CPU (stream::Decode::Substream);
-        // the Settings choice applies to main streams and playback.
-        for cam in &mut self.cams {
+        for i in 0..self.cams.len() {
             let c = ctx.clone();
-            cam.shared = stream::start(
-                cam.sub_url.clone(),
-                stream::Decode::Substream,
-                true,
-                GRID_COALESCE,
-                move |d| c.request_repaint_after(d),
-            );
+            let decode = self.decode_for(true);
+            let cam = &mut self.cams[i];
+            cam.shared =
+                stream::start(cam.sub_url.clone(), decode, true, GRID_COALESCE, move |d| {
+                    c.request_repaint_after(d)
+                });
         }
     }
 
@@ -448,7 +508,7 @@ impl App {
         let c = ctx.clone();
         let main = stream::start(
             url,
-            stream::Decode::Preferred(self.prefs.hwaccel()),
+            self.decode_for(false),
             true,
             REPAINT_COALESCE,
             move |d| c.request_repaint_after(d),
@@ -593,6 +653,7 @@ impl App {
         else {
             return;
         };
+        let decode = self.decode_for(false);
         let Some(f) = &mut self.focused else {
             self.pending_playback = None;
             return;
@@ -624,7 +685,7 @@ impl App {
             client.clone(),
             nvr::track(ch),
             codec,
-            self.prefs.hwaccel(),
+            decode,
             self.ctx.clone(),
             f.main.clone(),
             self.prefs.playback_speed,
@@ -636,6 +697,7 @@ impl App {
 
     /// Back to live on the same camera: restart the main-stream pipe.
     fn exit_playback(&mut self) {
+        let decode = self.decode_for(false);
         let Some(f) = &mut self.focused else {
             return;
         };
@@ -651,13 +713,9 @@ impl App {
         f.note = None;
         if let Some(url) = self.cams[f.idx].main_url.clone() {
             let c = self.ctx.clone();
-            f.main = stream::start(
-                url,
-                stream::Decode::Preferred(self.prefs.hwaccel()),
-                true,
-                REPAINT_COALESCE,
-                move |d| c.request_repaint_after(d),
-            );
+            f.main = stream::start(url, decode, true, REPAINT_COALESCE, move |d| {
+                c.request_repaint_after(d)
+            });
         }
         self.save_view_state(&host, Some(pos), false);
     }

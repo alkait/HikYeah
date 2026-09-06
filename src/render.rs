@@ -5,9 +5,10 @@
 // per-tile GPU state keyed by a stable tile id (grid substream or focused
 // main stream).
 
-use crate::stream;
+use crate::{gpu, stream};
 use eframe::egui_wgpu::{self, wgpu};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 /// Render adapter names seen at startup, for the Settings dropdown.
@@ -83,10 +84,24 @@ pub struct VideoRenderer {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     tiles: HashMap<u64, Tile>,
+    /// Zero-copy import is on until the first failure (gpu.rs).
+    zero_copy: gpu::ZeroCopy,
 }
 
+/// Imported textures the decoder's surface pool keeps coming back to.
+const DMA_CACHE: usize = 24;
+/// Frames whose surfaces stay referenced past their replacement, so the
+/// decoder can't reuse a surface the GPU may still be reading.
+const DMA_HOLD: usize = 3;
+
 struct Tile {
+    /// Textures for CPU frames (I420 or downloaded NV12).
     planes: Option<Planes>,
+    /// Imported DMA-BUF surfaces by buffer identity, oldest first.
+    dma: Vec<(u64, Planes)>,
+    /// Which imported surface the current frame is; None = `planes`.
+    active_dma: Option<u64>,
+    hold: VecDeque<Arc<gpu::DmaFrame>>,
     /// What the textures hold: the source stream (by address — playback
     /// swaps streams under one tile id, each restarting its sequence) and
     /// the frame sequence number; 0 = nothing yet.
@@ -98,6 +113,9 @@ impl Tile {
     fn new(device: &wgpu::Device) -> Self {
         Tile {
             planes: None,
+            dma: Vec::new(),
+            active_dma: None,
+            hold: VecDeque::new(),
             uploaded: (0, 0),
             uv_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("video params"),
@@ -119,7 +137,11 @@ struct Planes {
 }
 
 impl VideoRenderer {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        zero_copy: gpu::ZeroCopy,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("video"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -199,7 +221,88 @@ impl VideoRenderer {
             layout,
             sampler,
             tiles: HashMap::new(),
+            zero_copy,
         }
+    }
+
+    fn bind(
+        &self,
+        device: &wgpu::Device,
+        views: &[wgpu::TextureView],
+        uv_buf: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("video"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&views[2]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uv_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// A GPU-resident frame: import its surface once per buffer, then just
+    /// point the tile at the cached textures.
+    fn use_dma(&mut self, id: u64, device: &wgpu::Device, dma: &Arc<gpu::DmaFrame>) -> bool {
+        let tile = self.tiles.entry(id).or_insert_with(|| Tile::new(device));
+        if !tile.dma.iter().any(|(ino, _)| *ino == dma.ino) {
+            let tex = match gpu::import(device, dma) {
+                Ok(t) => t,
+                Err(e) => {
+                    // Once is enough: every decoder switches to downloading.
+                    if self.zero_copy.swap(false, Ordering::Relaxed) {
+                        eprintln!("[gpu] zero-copy import failed, downloading frames instead: {e}");
+                    }
+                    return false;
+                }
+            };
+            let views = [
+                tex[0].create_view(&Default::default()),
+                tex[1].create_view(&Default::default()),
+                tex[1].create_view(&Default::default()),
+            ];
+            let uv_buf = tile.uv_buf.clone();
+            let bind = self.bind(device, &views, &uv_buf);
+            let tile = self.tiles.get_mut(&id).unwrap();
+            if tile.dma.len() >= DMA_CACHE {
+                tile.dma.remove(0);
+            }
+            tile.dma.push((
+                dma.ino,
+                Planes {
+                    width: dma.width as usize,
+                    height: dma.height as usize,
+                    format: stream::PixFmt::Nv12,
+                    tex: tex.into(),
+                    bind,
+                },
+            ));
+        }
+        let tile = self.tiles.get_mut(&id).unwrap();
+        tile.active_dma = Some(dma.ino);
+        tile.hold.push_back(dma.clone());
+        while tile.hold.len() > DMA_HOLD {
+            tile.hold.pop_front();
+        }
+        true
     }
 
     fn ensure_planes(
@@ -253,32 +356,8 @@ impl VideoRenderer {
         if views.len() == 2 {
             views.push(tex[1].create_view(&Default::default()));
         }
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("video"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&views[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&views[1]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&views[2]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: tile.uv_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let uv_buf = tile.uv_buf.clone();
+        let bind = self.bind(device, &views, &uv_buf);
         let tile = self.tiles.get_mut(&id).unwrap();
         tile.planes = Some(Planes {
             width: w,
@@ -305,8 +384,15 @@ impl VideoRenderer {
         {
             return;
         }
+        if let Some(dma) = &f.dma {
+            if self.use_dma(id, device, dma) {
+                self.tiles.get_mut(&id).unwrap().uploaded = (source, f.seq);
+            }
+            return;
+        }
         self.ensure_planes(id, device, f.width, f.height, f.format);
         let tile = self.tiles.get_mut(&id).unwrap();
+        tile.active_dma = None;
         let p = tile.planes.as_ref().unwrap();
         let (w, h) = (f.width, f.height);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -346,12 +432,17 @@ impl VideoRenderer {
         tile.uploaded = (source, f.seq);
     }
 
+    /// The tile's textures for the frame it currently shows.
+    fn current_planes(tile: &Tile) -> Option<&Planes> {
+        match tile.active_dma {
+            Some(ino) => tile.dma.iter().find(|(i, _)| *i == ino).map(|(_, p)| p),
+            None => tile.planes.as_ref(),
+        }
+    }
+
     fn set_params(&self, id: u64, queue: &wgpu::Queue, uv: eframe::egui::Rect) {
         if let Some(tile) = self.tiles.get(&id) {
-            let nv12 = tile
-                .planes
-                .as_ref()
-                .is_some_and(|p| p.format == stream::PixFmt::Nv12);
+            let nv12 = Self::current_planes(tile).is_some_and(|p| p.format == stream::PixFmt::Nv12);
             let vals = [
                 uv.min.x,
                 uv.min.y,
@@ -417,7 +508,7 @@ impl egui_wgpu::CallbackTrait for VideoCallback {
     ) {
         let r: &VideoRenderer = resources.get().expect("VideoRenderer registered");
         if let Some(tile) = r.tiles.get(&self.id)
-            && let (Some(p), true) = (&tile.planes, tile.uploaded.1 > 0)
+            && let (Some(p), true) = (VideoRenderer::current_planes(tile), tile.uploaded.1 > 0)
         {
             render_pass.set_pipeline(&r.pipeline);
             render_pass.set_bind_group(0, &p.bind, &[]);
