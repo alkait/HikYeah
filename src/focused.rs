@@ -178,7 +178,7 @@ impl App {
                     0.0,
                     egui::Color32::from_white_alpha((178.0 * (1.0 - t)) as u8),
                 );
-                ui.ctx().request_repaint_after(crate::REPAINT_COALESCE);
+                crate::repaint_after(ui.ctx(), crate::REPAINT_COALESCE);
             } else {
                 self.flash_at = None;
             }

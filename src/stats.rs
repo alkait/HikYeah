@@ -621,7 +621,7 @@ impl App {
             let smooth = self.prefs.smooth_live;
             self.nerd.refresh(&target, decode, smooth, events);
         }
-        ctx.request_repaint_after(REFRESH);
+        crate::repaint_after(ctx, REFRESH);
 
         let default_pos = self
             .prefs

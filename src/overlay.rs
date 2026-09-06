@@ -325,7 +325,7 @@ impl App {
             self.hud = None;
             return;
         };
-        ctx.request_repaint_after(crate::REPAINT_COALESCE);
+        crate::repaint_after(ctx, crate::REPAINT_COALESCE);
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
             egui::Id::new("hud"),

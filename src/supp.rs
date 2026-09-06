@@ -528,7 +528,7 @@ impl App {
         // e.g. a pane's freeze frame landing during a pause.
         let (shared, sink) =
             stream::start_pipe(codec, decode.clone(), crate::GRID_COALESCE, move |d| {
-                ctx.request_repaint_after(d)
+                crate::repaint_after(&ctx, d)
             });
         let session = rtsp::start(
             rtsp::Request {

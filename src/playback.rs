@@ -509,7 +509,7 @@ impl Playback {
             self.codec,
             self.decode.clone(),
             crate::REPAINT_COALESCE,
-            move |d| ctx.request_repaint_after(d),
+            move |d| crate::repaint_after(&ctx, d),
         );
         let status = shared.clone();
         let ctx = self.ctx.clone();

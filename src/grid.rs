@@ -251,14 +251,14 @@ impl App {
             if now >= deadline {
                 self.key_sel = None;
             } else {
-                ui.ctx().request_repaint_after(deadline - now);
+                crate::repaint_after(ui.ctx(), deadline - now);
             }
         }
 
         self.update_drag(ui, &layout);
         let animating = self.drag.is_some() || Instant::now() < self.settle_until;
         if animating {
-            ui.ctx().request_repaint_after(crate::REPAINT_COALESCE);
+            crate::repaint_after(ui.ctx(), crate::REPAINT_COALESCE);
         }
         let pointer = ui.input(|i| i.pointer.latest_pos());
         let lifted_idx = self.drag.as_ref().map(|d| d.idx);

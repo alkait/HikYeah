@@ -140,12 +140,15 @@ impl Shared {
             .store(coalesce.as_millis() as u32, Ordering::Relaxed);
     }
 
-    /// A frame landed: ask for the screen, at this stream's urgency.
-    fn wake(&self, wake: &(impl Fn(Duration) + Send)) {
+    /// Something to show: ask for the screen at `due`, no sooner than this
+    /// stream's coalescing window. A smoothed frame is due ~200 ms out —
+    /// waking at the window instead redrew the full-size view once per
+    /// decoded frame on top of the pump's own schedule (measured 60
+    /// updates/s on a 25 fps 4K camera, 25 after).
+    fn wake(&self, due: Instant, wake: &(impl Fn(Duration) + Send)) {
         if self.visible.load(Ordering::Relaxed) {
-            wake(Duration::from_millis(u64::from(
-                self.coalesce_ms.load(Ordering::Relaxed),
-            )));
+            let window = Duration::from_millis(u64::from(self.coalesce_ms.load(Ordering::Relaxed)));
+            wake(due.saturating_duration_since(Instant::now()).max(window));
         }
     }
 
@@ -387,7 +390,7 @@ impl Pacer {
                 self.win_frames = 0;
             }
         }
-        sh.wake(wake);
+        sh.wake(due, wake);
     }
 }
 
@@ -453,7 +456,7 @@ pub fn start(
                     }
                     st.fps = 0.0;
                 }
-                sh.wake(&wake);
+                sh.wake(Instant::now(), &wake);
                 std::thread::sleep(Duration::from_secs(2));
             }
             sh.stats.lock().unwrap().tid = None;
@@ -507,7 +510,7 @@ pub fn start_pipe(
             }
             sh.stats.lock().unwrap().tid = None;
             sh.ended.store(true, Ordering::SeqCst);
-            sh.wake(&wake);
+            sh.wake(Instant::now(), &wake);
         })
         .expect("spawn playback thread");
     (shared, PipeSink(tx))

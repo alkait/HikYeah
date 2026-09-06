@@ -276,6 +276,8 @@ pub struct App {
     dbg_frames: u32,
     dbg_spent: std::time::Duration,
     dbg_win_start: Instant,
+    dbg_causes: std::collections::HashMap<String, u32>,
+    dbg_prev_update: Option<Instant>,
     pub update: UpdateUi,
     pub upd_tx: std::sync::mpsc::Sender<update::Msg>,
     upd_rx: std::sync::mpsc::Receiver<update::Msg>,
@@ -303,6 +305,15 @@ pub const MAIN_BIT: u64 = 1 << 32;
 /// measured: GPU busy time 39% → 25% on a 5K panel.
 pub const REPAINT_COALESCE: std::time::Duration = std::time::Duration::from_millis(16);
 pub const GRID_COALESCE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Ask for a repaint in `d`, meaning it. egui subtracts its predicted frame
+/// time from every delayed request "to avoid over-shooting", and eframe
+/// never updates that prediction from its 1/60 s default — so a 16 ms
+/// request became an immediate one and a 40 ms one 23 ms. Measured on the
+/// 4K camera view: 60 updates/s at a 25 fps stream before, 25 after.
+pub fn repaint_after(ctx: &egui::Context, d: std::time::Duration) {
+    ctx.request_repaint_after(d + std::time::Duration::from_secs_f32(1.0 / 60.0));
+}
 
 /// The modifiers held when `key` was pressed this frame. Read off the press
 /// event rather than the frame-end modifier state so a chord delivered inside
@@ -387,6 +398,8 @@ impl App {
             dbg_frames: 0,
             dbg_spent: std::time::Duration::ZERO,
             dbg_win_start: Instant::now(),
+            dbg_causes: Default::default(),
+            dbg_prev_update: None,
             update: UpdateUi::Idle,
             upd_tx,
             upd_rx,
@@ -523,7 +536,7 @@ impl App {
             let cam = &mut self.cams[i];
             cam.shared =
                 stream::start(cam.sub_url.clone(), decode, true, GRID_COALESCE, move |d| {
-                    c.request_repaint_after(d)
+                    repaint_after(&c, d)
                 });
         }
     }
@@ -570,7 +583,7 @@ impl App {
             self.decode_for(false),
             true,
             REPAINT_COALESCE,
-            move |d| c.request_repaint_after(d),
+            move |d| repaint_after(&c, d),
         );
         self.focused = Some(Focused {
             idx,
@@ -825,7 +838,7 @@ impl App {
         if let Some(url) = self.cams[f.idx].main_url.clone() {
             let c = self.ctx.clone();
             f.main = stream::start(url, decode, true, REPAINT_COALESCE, move |d| {
-                c.request_repaint_after(d)
+                repaint_after(&c, d)
             });
         }
         self.supp.switch_to_live();
@@ -1232,12 +1245,43 @@ impl eframe::App for App {
         let dbg_start = std::env::var_os("HIK_DEBUG").map(|_| Instant::now());
         if let Some(now) = dbg_start {
             self.dbg_frames += 1;
+            // Interval since the previous update, bucketed.
+            if let Some(prev) = self.dbg_prev_update {
+                let ms = now.duration_since(prev).as_millis();
+                let b = match ms {
+                    0..=3 => "gap<4ms",
+                    4..=11 => "gap 4-11",
+                    12..=19 => "gap 12-19",
+                    20..=29 => "gap 20-29",
+                    30..=45 => "gap 30-45",
+                    _ => "gap>45",
+                };
+                *self.dbg_causes.entry(b.into()).or_insert(0) += 1;
+            }
+            self.dbg_prev_update = Some(now);
+            // Who asked for this update (egui's repaint causes, by call site)
+            // and how long after the previous one — a redraw-rate mystery
+            // is answered by this line.
+            for c in ui.ctx().repaint_causes() {
+                *self
+                    .dbg_causes
+                    .entry(format!("{}:{}", c.file, c.line))
+                    .or_insert(0) += 1;
+            }
             let win = now.duration_since(self.dbg_win_start);
             if win.as_secs_f32() >= 2.0 {
+                let mut causes: Vec<(String, u32)> = self.dbg_causes.drain().collect();
+                causes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                let causes: Vec<String> = causes
+                    .iter()
+                    .take(6)
+                    .map(|(k, n)| format!("{k}×{n}"))
+                    .collect();
                 eprintln!(
-                    "[ui] {:.0} updates/s, {:.2} ms inside ui() per update",
+                    "[ui] {:.0} updates/s, {:.2} ms inside ui() per update; causes: {}",
                     self.dbg_frames as f32 / win.as_secs_f32(),
                     self.dbg_spent.as_secs_f64() * 1000.0 / self.dbg_frames as f64,
+                    causes.join(" "),
                 );
                 self.dbg_frames = 0;
                 self.dbg_spent = std::time::Duration::ZERO;
@@ -1455,7 +1499,7 @@ impl eframe::App for App {
             } else {
                 GRID_COALESCE
             };
-            ctx.request_repaint_after(d.saturating_duration_since(now).max(window));
+            repaint_after(&ctx, d.saturating_duration_since(now).max(window));
         }
 
         let avail = ui.max_rect();
