@@ -33,6 +33,7 @@ mod settings;
 mod snapshot;
 mod stats;
 mod stream;
+mod supp;
 mod tile;
 mod timeline;
 mod update;
@@ -246,6 +247,12 @@ pub struct App {
     /// puts on one camera's video while a draw box is ticked.
     pub zones: zones::Store,
     pub overlay: Option<zones::Overlay>,
+    /// Supplementary panes on the focused camera, the `+` selector, and
+    /// the origin to return to from a promoted pane (index, was in
+    /// playback, position).
+    pub supp: supp::Manager,
+    pub pane_selector: Option<supp::Selector>,
+    pub promoted_origin: Option<(usize, bool, Option<chrono::DateTime<chrono::Utc>>)>,
     pub event_memo: events::Memo,
     pub seen: events::SeenStore,
     /// Warm today's + yesterday's event log once the NVR client lands
@@ -363,6 +370,9 @@ impl App {
             event_pane: None,
             zones: Default::default(),
             overlay: None,
+            supp: Default::default(),
+            pane_selector: None,
+            promoted_origin: None,
             event_memo: Default::default(),
             seen: events::SeenStore::load(),
             warm_events: false,
@@ -570,38 +580,65 @@ impl App {
             playback: None,
             note: None,
         });
+        let host = self.cams[idx].host.clone();
+        // Panes survive playback exits on the same camera; any other focus
+        // change tears them down (their layout is saved for restore).
+        if self.supp.attached_host.as_deref() != Some(host.as_str()) {
+            self.supp.teardown();
+        }
+        self.pane_selector = None;
         self.update_visibility();
         self.last_key_sel = idx; // arrows resume from here after unfocus
         self.key_sel = None;
-        let host = self.cams[idx].host.clone();
         if host.is_empty() {
             return;
         }
         session::save(session::Location::Camera, Some(&host));
-        // A camera view just opened fresh: if it was left in playback, bring
-        // the position back (AppDelegate.restoreViewState).
-        if restore
-            && self.prefs.remember_last_view
-            && let Some(st) = session::load().per_camera.get(&host)
-            && st.mode == session::Mode::Playback
-        {
-            self.enter_playback(st.position());
+        // A camera view just opened fresh: bring back its panes and, if it
+        // was left in playback, the position (AppDelegate.restoreViewState).
+        if restore && self.prefs.remember_last_view {
+            self.restore_panes_if_remembered(&host);
+            if let Some(st) = session::load().per_camera.get(&host)
+                && st.mode == session::Mode::Playback
+            {
+                self.enter_playback(st.position());
+            }
         }
     }
 
     pub fn unfocus(&mut self) {
-        if let Some(f) = self.focused.take() {
-            self.stop_recording(); // a clip follows its camera, not the view
-            self.pending_playback = None;
-            // Remember the outgoing view (before its playback is torn down).
-            let host = self.cams[f.idx].host.clone();
-            let pos = f.playback.as_ref().map(playback::Playback::position);
-            f.main.stop(); // its supervisor would otherwise reconnect forever
-            drop(f); // ends any playback pipe
-            self.update_visibility();
-            self.save_view_state(&host, pos, pos.is_some());
+        // A promoted view was recorded as its origin at promote time.
+        let record = self.promoted_origin.take().is_none();
+        self.unfocus_inner(record);
+        if record {
             session::save(session::Location::Grid, None);
         }
+    }
+
+    /// Programmatic navigation (promote, back): leave the view without
+    /// recording it as where the user left off.
+    fn unfocus_quiet(&mut self) {
+        self.unfocus_inner(false);
+    }
+
+    fn unfocus_inner(&mut self, record: bool) {
+        let Some(f) = self.focused.take() else {
+            return;
+        };
+        self.stop_recording(); // a clip follows its camera, not the view
+        self.pending_playback = None;
+        self.pane_selector = None;
+        // Remember the outgoing view (before its playback and panes are
+        // torn down).
+        let host = self.cams[f.idx].host.clone();
+        let pos = f.playback.as_ref().map(playback::Playback::position);
+        if record {
+            self.save_view_state(&host, pos, pos.is_some());
+        }
+        f.main.stop(); // its supervisor would otherwise reconnect forever
+        drop(f); // ends any playback pipe
+        self.supp.teardown();
+        self.update_visibility();
     }
 
     /// Record how `host`'s camera view looks right now. The last playback
@@ -615,6 +652,7 @@ impl App {
         if host.is_empty() {
             return;
         }
+        let panes = self.supp.attached_host.as_deref() == Some(host) && self.supp.count() > 0;
         session::update(|s| {
             let entry = s.per_camera.entry(host.to_string()).or_default();
             entry.mode = if in_playback {
@@ -625,6 +663,7 @@ impl App {
             if let Some(p) = position {
                 entry.playback_position = Some(session::to_apple(p));
             }
+            entry.panes_visible = panes;
         });
     }
 
@@ -789,6 +828,7 @@ impl App {
                 c.request_repaint_after(d)
             });
         }
+        self.supp.switch_to_live();
         self.save_view_state(&host, Some(pos), false);
     }
 
@@ -822,11 +862,15 @@ impl App {
         // Every play/seek/pause refreshes the remembered position (crash
         // insurance; a clean quit records it exactly).
         let transport = pb.transport.take();
+        let speed = pb.speed;
         if let Some(text) = hud {
             self.flash(&text);
         }
-        if let Some((pos, _)) = transport {
-            self.save_view_state(&host, Some(pos), true);
+        if let Some((pos, paused)) = transport {
+            if self.promoted_origin.is_none() {
+                self.save_view_state(&host, Some(pos), true);
+            }
+            self.panes_transport(pos, speed, paused);
         }
     }
 
@@ -986,6 +1030,8 @@ impl App {
             }
         } else if self.event_pane.is_some() {
             self.event_pane_escape();
+        } else if self.pane_selector.is_some() {
+            self.pane_selector_escape();
         } else if self.drag.is_some() {
             self.cancel_drag();
         } else if self.key_sel.is_some() {
@@ -1001,6 +1047,8 @@ impl App {
             } else {
                 self.exit_playback();
             }
+        } else if self.promoted_origin.is_some() {
+            self.go_back_from_promoted();
         } else {
             self.unfocus();
         }
@@ -1204,8 +1252,11 @@ impl eframe::App for App {
             if let Some(r) = self.recorder.take() {
                 r.stop_and_wait();
             }
-            // Record where the user quit — the exact playback position.
-            if let Some(f) = &self.focused {
+            // Record where the user quit — the exact playback position. A
+            // promoted view was already recorded as its origin.
+            if let Some(f) = &self.focused
+                && self.promoted_origin.is_none()
+            {
                 let host = self.cams[f.idx].host.clone();
                 let pos = f.playback.as_ref().map(playback::Playback::position);
                 self.save_view_state(&host, pos, pos.is_some());
@@ -1252,19 +1303,23 @@ impl eframe::App for App {
         // The help sheet swallows the key or click that closes it; text
         // fields keep their keystrokes (a "?" in a password is a "?").
         // The bookmark pane owns the keyboard while up (filter typing).
-        if self.bookmark_pane.is_some() || self.event_pane.is_some() {
+        if self.bookmark_pane.is_some() || self.event_pane.is_some() || self.pane_selector.is_some()
+        {
             let events = ui.input(|i| i.events.clone());
             for e in &events {
                 if self.bookmark_pane.is_some() {
                     self.bookmark_pane_key(e);
-                } else {
+                } else if self.event_pane.is_some() {
                     self.event_pane_key(e);
+                } else {
+                    self.pane_selector_key(e);
                 }
             }
         }
         let typing = ctx.egui_wants_keyboard_input()
             || self.bookmark_pane.is_some()
-            || self.event_pane.is_some();
+            || self.event_pane.is_some()
+            || self.pane_selector.is_some();
         let help_was_open = self.help_open;
         if help_was_open {
             if ui.input(|i| {
@@ -1333,11 +1388,24 @@ impl eframe::App for App {
                 {
                     self.toggle_event_pane();
                 }
+                // + on a focused view adds a supplementary pane (selector);
+                // - closes panes, most recently added first.
+                if self.focused.is_some() {
+                    if ui.input(|i| {
+                        i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)
+                    }) {
+                        self.open_pane_selector();
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Minus)) {
+                        self.close_last_pane();
+                    }
+                }
                 self.playback_keys(ui);
             }
         }
         self.poll_playback();
         self.poll_event_pane();
+        self.poll_panes();
 
         // Promote every due frame to the screen and wake up exactly when the
         // next scheduled frame is due (smoothing's presentation pump).
@@ -1348,11 +1416,28 @@ impl eframe::App for App {
                 next_due = Some(next_due.map_or(d, |n| n.min(d)));
             }
         };
+        // The focused camera's substream is only a stand-in until the main
+        // stream (or playback) has a picture; after that its frames must
+        // not wake the UI — they would add their cadence to the redraw
+        // rate of the full-size view.
         let focused = self.focused.as_ref().map(|f| f.idx);
+        let stand_in = self.focused.as_ref().is_some_and(|f| {
+            f.main.current.lock().unwrap().is_none()
+                && f.playback
+                    .as_ref()
+                    .is_none_or(|pb| pb.shown.current.lock().unwrap().is_none())
+        });
         for (i, cam) in self.cams.iter().enumerate() {
             let due = cam.shared.advance(now);
-            if focused.is_none_or(|f| f == i) {
-                bump(due);
+            match focused {
+                None => bump(due),
+                Some(f) if f == i => {
+                    cam.shared.set_visible(stand_in, REPAINT_COALESCE);
+                    if stand_in {
+                        bump(due);
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(f) = &self.focused {
@@ -1360,6 +1445,7 @@ impl eframe::App for App {
             if let Some(pb) = &f.playback {
                 bump(pb.advance(now));
             }
+            bump(self.supp.advance(now));
         }
         if let Some(d) = next_due {
             // Quantized to the coalescing window — a frame due in 2 ms must
@@ -1383,6 +1469,7 @@ impl eframe::App for App {
         self.show_bookmark_prompt(&ctx);
         self.show_bookmark_pane(&ctx);
         self.show_event_pane(&ctx);
+        self.show_pane_selector(&ctx);
         self.show_save_prompt(&ctx);
         self.show_top_bar(&ctx);
         self.show_update_banner(&ctx);

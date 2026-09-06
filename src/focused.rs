@@ -193,6 +193,37 @@ impl App {
             tile::WHITE,
         );
 
+        // Supplementary panes sit over the video, under the bar and badges.
+        let zoomed = f.zoomed();
+        let in_playback = f.playback.is_some();
+        self.show_panes(ui, avail);
+        // The translucent back arrow shows only when Esc's next action would
+        // leave the promoted view (not zoomed, not in playback).
+        if self.promoted_origin.is_some() && !in_playback && !zoomed {
+            let r = egui::Rect::from_min_size(
+                avail.left_top() + egui::vec2(6.0, 30.0),
+                egui::vec2(28.0, 28.0),
+            );
+            let resp = ui.interact(r, egui::Id::new("promoted back"), egui::Sense::CLICK);
+            let alpha = if resp.hovered() { 230 } else { 165 };
+            ui.painter()
+                .circle_filled(r.center(), 14.0, egui::Color32::from_white_alpha(alpha));
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                "←",
+                egui::FontId::monospace(16.0),
+                egui::Color32::BLACK,
+            );
+            if resp.on_hover_text("Back — Esc").clicked() {
+                self.go_back_from_promoted();
+                return;
+            }
+        }
+        let Some(f) = &mut self.focused else {
+            return;
+        };
+
         if let Some(pb) = &mut f.playback
             && pb.show_bar(ui, avail)
         {

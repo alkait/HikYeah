@@ -21,10 +21,38 @@ pub fn request(
     body: Option<(&str, &[u8])>,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
+    request_with(host, user, password, path, body, timeout, false)
+}
+
+/// Ask the camera to emit an IDR frame right now instead of waiting out
+/// the GOP (~2-4 s). Runtime request only — changes no configuration.
+pub fn request_key_frame(host: &str, user: &str, password: &str, channel: &str) {
+    let path = format!("/ISAPI/Streaming/channels/{channel}/requestKeyFrame");
+    let _ = request_with(
+        host,
+        user,
+        password,
+        &path,
+        Some(("text/plain", b"")),
+        Duration::from_secs(5),
+        true,
+    );
+}
+
+fn request_with(
+    host: &str,
+    user: &str,
+    password: &str,
+    path: &str,
+    body: Option<(&str, &[u8])>,
+    timeout: Duration,
+    put: bool,
+) -> Option<Vec<u8>> {
     let url = format!("http://{host}{path}");
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let send = |auth: Option<&str>| {
         let mut req = match body {
+            Some((ct, _)) if put => agent.put(&url).set("Content-Type", ct),
             Some((ct, _)) => agent.post(&url).set("Content-Type", ct),
             None => agent.get(&url),
         };
@@ -45,10 +73,10 @@ pub fn request(
             };
             let www = r.header("www-authenticate")?.to_string();
             let mut prompt = digest_auth::parse(&www).ok()?;
-            let method = if body.is_some() {
-                digest_auth::HttpMethod::POST
-            } else {
-                digest_auth::HttpMethod::GET
+            let method = match body {
+                Some(_) if put => digest_auth::HttpMethod::PUT,
+                Some(_) => digest_auth::HttpMethod::POST,
+                None => digest_auth::HttpMethod::GET,
             };
             let ctx = digest_auth::AuthContext::new_with_method(
                 user,
