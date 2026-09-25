@@ -96,6 +96,11 @@ pub struct Stats {
     pub tid: Option<u32>,
     /// Whether pictures come off a hardware decoder.
     pub hardware: bool,
+    /// The camera's audio track (codec name from the SDP); None = no mic.
+    pub audio_codec: Option<String>,
+    /// While audio is on: the output device's format, or why it failed.
+    pub audio_out: Option<String>,
+    pub audio_error: Option<String>,
 }
 
 const SAMPLE_CAP: usize = 512;
@@ -111,6 +116,9 @@ pub struct Shared {
     pub visible: AtomicBool,
     /// Repaint coalescing window for this stream's wakes, in ms.
     pub coalesce_ms: AtomicU32,
+    /// Play the camera's audio track (A on the focused camera). Off at
+    /// launch, never remembered; the decoder checks it per audio packet.
+    pub audio: AtomicBool,
     /// The frame currently on screen (renderer reads this).
     pub current: Mutex<Option<Frame>>,
     /// Frames scheduled for the future, front = next due.

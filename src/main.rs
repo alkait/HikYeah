@@ -13,6 +13,7 @@
 //   hikyeah <rtsp-url>     single explicit URL (no focus view, no editing)
 //   hikyeah --test         ffmpeg synthetic test pattern (no camera needed)
 
+mod audio;
 mod bookmarks;
 mod config;
 mod decode;
@@ -683,6 +684,37 @@ impl App {
         });
     }
 
+    /// A: the focused camera's audio track on or off — live only (the
+    /// playback client carries no audio). Off at launch, never remembered.
+    fn toggle_audio(&mut self) {
+        let Some(f) = &self.focused else {
+            return;
+        };
+        if f.playback.is_some() {
+            self.flash("no audio in playback");
+            return;
+        }
+        let (codec, frames) = {
+            let st = f.main.stats.lock().unwrap();
+            (st.audio_codec.is_some(), st.frames)
+        };
+        let text = if codec {
+            if f.main
+                .audio
+                .fetch_xor(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                "audio off"
+            } else {
+                "audio on"
+            }
+        } else if frames == 0 {
+            "audio: stream not up yet"
+        } else {
+            "no audio track on this camera"
+        };
+        self.flash(text);
+    }
+
     /// P on a focused camera: playback resumes from the camera's remembered
     /// position (not "a minute ago") when that's on.
     fn playback_key(&mut self) {
@@ -840,9 +872,14 @@ impl App {
         f.note = None;
         if let Some(url) = self.cams[f.idx].main_url.clone() {
             let c = self.ctx.clone();
+            // Audio survives the round trip through playback.
+            let audio = f.main.audio.load(std::sync::atomic::Ordering::Relaxed);
             f.main = stream::start(url, decode, true, REPAINT_COALESCE, move |d| {
                 repaint_after(&c, d)
             });
+            f.main
+                .audio
+                .store(audio, std::sync::atomic::Ordering::Relaxed);
         }
         self.supp.switch_to_live();
         self.save_view_state(&host, Some(pos), false);
@@ -1424,6 +1461,9 @@ impl eframe::App for App {
                 if ui.input(|i| i.key_pressed(egui::Key::I)) {
                     self.prefs.nerd_stats = !self.prefs.nerd_stats;
                     self.prefs.save();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::A)) {
+                    self.toggle_audio();
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::P)) && self.focused.is_some() {
                     self.playback_key();

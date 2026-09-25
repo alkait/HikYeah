@@ -94,6 +94,7 @@ passwords in clear — treat it as a secret):
 | `P` | recorded playback of the focused camera (from the NVR) |
 | `S` | snapshot of the focused camera (full resolution, from the camera itself; the frame at the playhead in playback) |
 | `R` | start / stop recording a clip of the focused camera (from the playhead in playback) |
+| `A` | audio of the focused camera on / off (live only; cameras whose stream carries an audio track) |
 | `I` | nerd stats panel (focused camera, or the selected grid tile) |
 | `?` | keyboard shortcut help |
 | `F11` | toggle full screen |

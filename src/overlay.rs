@@ -71,6 +71,7 @@ impl HelpContext {
                 ("drag", "pan while zoomed"),
                 ("S", "snapshot → Desktop"),
                 ("R", "record clip → Desktop"),
+                ("A", "audio on / off · cameras with a mic"),
                 ("I", "nerd stats"),
                 ("+", "add a supplementary pane"),
                 ("−", "close the last-added pane"),

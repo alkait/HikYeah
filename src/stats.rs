@@ -233,10 +233,38 @@ impl NerdStats {
                 segs.push(seg(" · software fallback ⚠", AMBER));
             }
         }
+        // audio: the track the camera announces (SDP) and, while on, the
+        // output it is resampled to.
+        let audio_on = target
+            .shared
+            .audio
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let audio = match (&st.audio_codec, audio_on) {
+            (None, _) if st.frames == 0 => vec![seg("—", tile::DIM)],
+            (None, _) => vec![seg("none", tile::DIM)],
+            (Some(c), false) => vec![seg(c.clone(), tile::WHITE), seg(" · off · A", tile::DIM)],
+            (Some(c), true) => {
+                let mut segs = vec![seg(c.clone(), tile::WHITE)];
+                if let Some(e) = &st.audio_error {
+                    segs.push(seg(format!(" · {e}"), AMBER));
+                } else if let Some(o) = &st.audio_out {
+                    segs.push(seg(format!(" · on · {o}"), tile::DIM));
+                } else {
+                    segs.push(seg(" · starting…", tile::DIM));
+                }
+                segs
+            }
+        };
         push(
             "decode",
             "The decode device chosen in Settings, then what this stream actually runs on. \"CPU (software)\" means the processor does the decompression — heavy for high-resolution HEVC and the usual cause of stutter; expect high app-side CPU below. \"software fallback\" means the device refused this stream (unsupported profile) and the CPU took over. \"zero-copy\" means decoded pictures stay on the GPU; \"download\" means they pass through system memory first.",
             segs,
+        );
+
+        push(
+            "audio",
+            "The camera's audio track as the stream announces it and, while on (A), the output device format it is resampled to. Off costs nothing: the packets arrive with the video either way and are skipped.",
+            audio,
         );
 
         // fps (5 s window of samples)

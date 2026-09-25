@@ -236,7 +236,9 @@ impl App {
             .recorder
             .as_ref()
             .map(|r| r.started.elapsed().as_secs());
-        if rec.is_some() || f.zoomed() {
+        let audio = f.playback.is_none() && f.main.audio.load(std::sync::atomic::Ordering::Relaxed);
+        let audio_failed = audio && f.main.stats.lock().unwrap().audio_error.is_some();
+        if rec.is_some() || f.zoomed() || audio {
             let mut reset = false;
             egui::Area::new(egui::Id::new("focused badges"))
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
@@ -266,6 +268,25 @@ impl App {
                                 });
                             ui.ctx()
                                 .request_repaint_after(std::time::Duration::from_secs(1));
+                        }
+                        if audio {
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_black_alpha(140))
+                                .corner_radius(3.0)
+                                .inner_margin(egui::Margin::symmetric(5, 2))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(if audio_failed {
+                                            "AUDIO ⚠"
+                                        } else {
+                                            "AUDIO"
+                                        })
+                                        .size(11.0)
+                                        .strong()
+                                        .monospace()
+                                        .color(tile::WHITE),
+                                    );
+                                });
                         }
                         if f.zoomed()
                             && ui

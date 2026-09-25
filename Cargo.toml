@@ -12,7 +12,8 @@ serde_json = "1.0.151"
 ureq = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 md-5 = "0.10"
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "device", "software-scaling"] }
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "device", "software-scaling", "software-resampling"] }
+cpal = "0.18"
 
 wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
 

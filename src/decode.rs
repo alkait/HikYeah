@@ -16,7 +16,6 @@ use ffmpeg_next::ffi as sys;
 use std::ffi::{CStr, CString, c_void};
 use std::io::Read;
 use std::ptr;
-#[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
@@ -258,6 +257,13 @@ unsafe extern "C" fn get_format(
 struct Session {
     ictx: ff::format::context::Input,
     stream_index: usize,
+    /// The camera's audio track, if the stream carries one — decoded only
+    /// while the user has it on (audio.rs).
+    audio_index: Option<usize>,
+    audio_codec: Option<String>,
+    audio: Option<crate::audio::Track>,
+    /// The output failed this session: reported once, not retried per packet.
+    audio_failed: bool,
     decoder: ff::decoder::Video,
     hw_fmt: Option<sys::AVPixelFormat>,
     hw_device: *mut sys::AVBufferRef,
@@ -285,6 +291,11 @@ impl Session {
             .best(ff::media::Type::Video)
             .ok_or("no video stream")?;
         let stream_index = stream.index();
+        let audio_stream = ictx.streams().best(ff::media::Type::Audio);
+        let audio_index = audio_stream.as_ref().map(|s| s.index());
+        let audio_codec = audio_stream
+            .and_then(|s| ff::decoder::find(s.parameters().id()))
+            .map(|c| c.name().to_string());
         let params = stream.parameters();
         let codec = ff::decoder::find(params.id()).ok_or("no decoder for this codec")?;
         let mut ctx = ff::codec::context::Context::new_with_codec(codec);
@@ -332,6 +343,10 @@ impl Session {
         Ok(Session {
             ictx,
             stream_index,
+            audio_index,
+            audio_codec,
+            audio: None,
+            audio_failed: false,
             decoder,
             hw_fmt,
             hw_device,
@@ -365,6 +380,7 @@ impl Session {
         } else {
             Path::Software
         };
+        sh.stats.lock().unwrap().audio_codec = self.audio_codec.clone();
         loop {
             let packet = {
                 let mut pkt = ff::Packet::empty();
@@ -381,6 +397,10 @@ impl Session {
                     Err(e) => return Err(format!("read: {e}")),
                 }
             };
+            if self.audio_index == Some(packet.stream()) {
+                self.audio_packet(sh, &packet);
+                continue;
+            }
             if packet.stream() != self.stream_index {
                 continue;
             }
@@ -403,6 +423,45 @@ impl Session {
         let _ = self.decoder.send_eof();
         let _ = self.drain(sh, &mut pacer, live, path, wake);
         Ok(())
+    }
+
+    /// An audio packet: decoded and played while the flag is on, skipped
+    /// otherwise — the track is opened on the first packet after a toggle
+    /// on and dropped (device released) on the first after a toggle off.
+    fn audio_packet(&mut self, sh: &Arc<Shared>, packet: &ff::Packet) {
+        if !sh.audio.load(Ordering::Relaxed) {
+            if self.audio.take().is_some() {
+                sh.stats.lock().unwrap().audio_out = None;
+            }
+            self.audio_failed = false;
+            return;
+        }
+        if self.audio.is_none() && !self.audio_failed {
+            let params = self
+                .ictx
+                .streams()
+                .nth(packet.stream())
+                .expect("audio stream index")
+                .parameters();
+            match crate::audio::Track::open(params) {
+                Ok(track) => {
+                    let mut st = sh.stats.lock().unwrap();
+                    st.audio_out = Some(track.describe());
+                    st.audio_error = None;
+                    self.audio = Some(track);
+                }
+                Err(e) => {
+                    debug(&e);
+                    sh.stats.lock().unwrap().audio_error = Some(e);
+                    self.audio_failed = true;
+                }
+            }
+        }
+        if let Some(track) = &mut self.audio
+            && let Err(e) = track.feed(packet)
+        {
+            debug(&e);
+        }
     }
 
     fn drain(
