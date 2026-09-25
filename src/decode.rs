@@ -16,6 +16,7 @@ use ffmpeg_next::ffi as sys;
 use std::ffi::{CStr, CString, c_void};
 use std::io::Read;
 use std::ptr;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
@@ -639,6 +640,7 @@ impl Drop for MappedFrame {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn debug(msg: &str) {
     if std::env::var_os("HIK_DEBUG").is_some() {
         eprintln!("[decode] {msg}");
