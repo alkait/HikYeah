@@ -272,6 +272,8 @@ pub struct App {
     snap_rx: std::sync::mpsc::Receiver<(u64, egui::ColorImage)>,
     /// Held for our lifetime; handed to relaunch() so the successor can take it.
     pub instance_lock: Option<std::fs::File>,
+    /// Close requested: this frame paints "Closing…", the next one exits.
+    closing: bool,
     /// HIK_DEBUG UI-loop stats: updates + time inside ui() per report window.
     dbg_frames: u32,
     dbg_spent: std::time::Duration,
@@ -395,6 +397,7 @@ impl App {
             snap_tx,
             snap_rx,
             instance_lock,
+            closing: false,
             dbg_frames: 0,
             dbg_spent: std::time::Duration::ZERO,
             dbg_win_start: Instant::now(),
@@ -1288,10 +1291,14 @@ impl eframe::App for App {
                 self.dbg_win_start = now;
             }
         }
-        // Close instantly: every ffmpeg dies on its broken stdout pipe the
-        // moment we're gone (PDEATHSIG covers stalled ones on Linux), and
-        // prefs are saved when changed — nothing needs a graceful path.
-        if ui.input(|i| i.viewport().close_requested()) {
+        // Close in two frames: the first paints "Closing…" and cancels
+        // eframe's own close so we get a second one, which exits. The
+        // exit itself can take ~1.5 s: the Vulkan loader opened the NVIDIA
+        // GPU at startup and the kernel wakes it from runtime suspend to
+        // release those handles — without the indicator the window just
+        // hangs. Nothing else needs a graceful path: every ffmpeg dies on
+        // its broken pipe, prefs are saved when changed.
+        if self.closing {
             // Except a clip in progress: give ffmpeg a moment to finalize.
             if let Some(r) = self.recorder.take() {
                 r.stop_and_wait();
@@ -1306,6 +1313,12 @@ impl eframe::App for App {
                 self.save_view_state(&host, pos, pos.is_some());
             }
             std::process::exit(0);
+        }
+        if ui.input(|i| i.viewport().close_requested()) {
+            self.closing = true;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx().request_repaint();
         }
         let ctx = ui.ctx().clone();
         // Fresh ISAPI snapshots replace the cached placeholders, unbadged.
@@ -1530,7 +1543,11 @@ impl eframe::App for App {
                 },
             );
         }
-        self.show_hud(&ctx);
+        if self.closing {
+            overlay::hud_box(&ctx, "Closing…", 1.0);
+        } else {
+            self.show_hud(&ctx);
+        }
         if let Some(start) = dbg_start {
             self.dbg_spent += start.elapsed();
         }

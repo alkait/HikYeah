@@ -326,21 +326,26 @@ impl App {
             return;
         };
         crate::repaint_after(ctx, crate::REPAINT_COALESCE);
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Tooltip,
-            egui::Id::new("hud"),
-        ));
-        let color = tile::WHITE.gamma_multiply(alpha);
-        let galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(14.0), color);
-        let rect = egui::Rect::from_center_size(
-            ctx.viewport_rect().center(),
-            galley.size() + egui::vec2(28.0, 18.0),
-        );
-        painter.rect_filled(
-            rect,
-            9.0,
-            egui::Color32::from_black_alpha((178.0 * alpha) as u8),
-        );
-        painter.galley(rect.min + egui::vec2(14.0, 9.0), galley, color);
+        hud_box(ctx, text, alpha);
     }
+}
+
+/// The HUD's rounded box with `text`, centered, at `alpha`.
+pub fn hud_box(ctx: &egui::Context, text: &str, alpha: f32) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("hud"),
+    ));
+    let color = tile::WHITE.gamma_multiply(alpha);
+    let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::proportional(14.0), color);
+    let rect = egui::Rect::from_center_size(
+        ctx.viewport_rect().center(),
+        galley.size() + egui::vec2(28.0, 18.0),
+    );
+    painter.rect_filled(
+        rect,
+        9.0,
+        egui::Color32::from_black_alpha((178.0 * alpha) as u8),
+    );
+    painter.galley(rect.min + egui::vec2(14.0, 9.0), galley, color);
 }
