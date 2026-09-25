@@ -18,3 +18,13 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 - Releases bundle ffmpeg pinned to a major branch (BtbN `n8.1-latest`): patches flow in automatically, majors bump only when the user asks. The macOS source is knowingly unpinned until there are Mac users. The app links the FFmpeg *libraries* (libavcodec/libavformat/libavutil/libswscale/libavdevice via pkg-config at build time); release archives must ship matching shared libraries next to the binary.
 - Every decoded pixel is cost: measured on a hybrid laptop, the old child-process pipe (raw frames through stdout, a conversion, a re-upload) was 4–5× the CPU of in-process decode, and a hardware decode *with a download* costs more CPU than software at small sizes. The zero-copy path (`gpu.rs`: VAAPI surfaces exported as DMA-BUFs, imported as Vulkan images on the Intel iGPU) is the model for other platforms: D3D11 shared textures on Windows, CVPixelBuffer/IOSurface on macOS. Never add a copy to a path that has none.
 - No tests for now.
+
+## Building on this machine
+
+There is no Rust toolchain and no FFmpeg headers on the dev laptop (it runs the installed release from `~/.local/share/hikyeah`; releases are built by CI). Build in a container that mirrors the Linux job in `.github/workflows/release.yml`:
+
+- `docker.io/library/rust:latest`, `apt-get install libclang-dev pkg-config`, the BtbN `ffmpeg-n8.1-latest-linux64-gpl-shared-8.1` tarball as `FFMPEG_DIR`, and `RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags'`.
+- `podman run --rm --security-opt label=disable -v <repo>:/src -v <scratch>:/work …` — SELinux refuses plain bind mounts; keep `CARGO_HOME`, `CARGO_TARGET_DIR` and the tarball under the scratch dir so rebuilds stay fast (a cold build is ~3 min plus image pull).
+- Run `cargo fmt` and `cargo clippy --release --all-targets -- -D warnings` inside the container too (mount the repo read-write so fmt can write).
+- To run the result natively, copy the binary into a directory with symlinks to the installed `libav*.so*` and `ffmpeg` (the `$ORIGIN` rpath resolves them). The user tests from there; a second instance is refused by the lock, so make sure none is running.
+- Hybrid-laptop facts worth knowing: the Vulkan loader enumerates the NVIDIA driver at startup, which wakes the sleeping dGPU (`/sys/bus/pci/devices/0000:01:00.0/power/runtime_status`) and makes exit block ~1.5 s while the kernel wakes it again to release the handles. Measure close/launch timings against that file.
