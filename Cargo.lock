@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "foreign-types"
-version = "0.6.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965"
 dependencies = [
@@ -1622,7 +1622,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hikyeah"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "ash",
  "chrono",
