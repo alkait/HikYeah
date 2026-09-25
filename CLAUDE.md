@@ -24,7 +24,9 @@ Cross-platform (Linux/macOS/Windows) rewrite of the macOS HikViewer app (`../Hik
 There is no Rust toolchain and no FFmpeg headers on the dev laptop (it runs the installed release from `~/.local/share/hikyeah`; releases are built by CI). Build in a container that mirrors the Linux job in `.github/workflows/release.yml`:
 
 - `docker.io/library/rust:latest`, `apt-get install libclang-dev pkg-config`, the BtbN `ffmpeg-n8.1-latest-linux64-gpl-shared-8.1` tarball as `FFMPEG_DIR`, and `RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags'`.
-- `podman run --rm --security-opt label=disable -v <repo>:/src -v <scratch>:/work …` — SELinux refuses plain bind mounts; keep `CARGO_HOME`, `CARGO_TARGET_DIR` and the tarball under the scratch dir so rebuilds stay fast (a cold build is ~3 min plus image pull).
+- The cache lives in `~/.cache/hikyeah-build` (`cargo`, `target`, `ffshared`, the tarball and `build.sh`, ~2 GB); delete the directory to reset. Build with
+  `podman run --rm --security-opt label=disable -v <repo>:/src -v ~/.cache/hikyeah-build:/work docker.io/library/rust:latest bash /work/build.sh`
+  — SELinux refuses plain bind mounts. A warm rebuild takes seconds; a cold one ~3 min plus image pull. Extract the tarball with `--no-same-owner`, or its files end up owned by a podman subuid and only `podman unshare rm -rf` can remove them.
 - Run `cargo fmt` and `cargo clippy --release --all-targets -- -D warnings` inside the container too (mount the repo read-write so fmt can write).
 - To run the result natively, copy the binary into a directory with symlinks to the installed `libav*.so*` and `ffmpeg` (the `$ORIGIN` rpath resolves them). The user tests from there; a second instance is refused by the lock, so make sure none is running.
 - Hybrid-laptop facts worth knowing: the Vulkan loader enumerates the NVIDIA driver at startup, which wakes the sleeping dGPU (`/sys/bus/pci/devices/0000:01:00.0/power/runtime_status`) and makes exit block ~1.5 s while the kernel wakes it again to release the handles. Measure close/launch timings against that file.
