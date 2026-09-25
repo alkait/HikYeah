@@ -38,7 +38,9 @@ pub struct StripInput {
 impl Playback {
     /// The bar along the bottom of `avail`. Returns true when the speed
     /// changed (the caller persists it).
-    pub fn show_bar(&mut self, ui: &mut egui::Ui, avail: egui::Rect) -> bool {
+    /// `xi_pinch`: the XInput pinch factor for this frame (gesture.rs), which
+    /// egui's zoom_delta doesn't carry.
+    pub fn show_bar(&mut self, ui: &mut egui::Ui, avail: egui::Rect, xi_pinch: f32) -> bool {
         let bar =
             egui::Rect::from_min_max(egui::pos2(avail.min.x, avail.max.y - BAR_HEIGHT), avail.max);
         ui.painter()
@@ -106,7 +108,7 @@ impl Playback {
                 STRIP_HEIGHT,
             ),
         );
-        self.show_strip(ui, strip);
+        self.show_strip(ui, strip, xi_pinch);
 
         if self.cal.open {
             self.show_calendar(ui.ctx(), date_button);
@@ -308,7 +310,7 @@ impl Playback {
     /// and dark over the teal band so they read everywhere. Click or drag
     /// anywhere to seek (fires on release); scroll or pinch to zoom through
     /// the presets, horizontal scroll to pan when zoomed.
-    fn show_strip(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn show_strip(&mut self, ui: &mut egui::Ui, rect: egui::Rect, xi_pinch: f32) {
         let painter = ui.painter().with_clip_rect(rect);
         painter.rect_filled(rect, 3.0, egui::Color32::from_gray(41));
         let label_h = 12.0;
@@ -481,7 +483,7 @@ impl Playback {
             self.seek(t);
         }
         if resp.hovered() {
-            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta() * xi_pinch));
             let at = resp
                 .hover_pos()
                 .map_or(self.position(), |p| self.date_at(rect, p.x));

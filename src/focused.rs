@@ -116,11 +116,17 @@ impl App {
             let base = tile::fit(avail, Some(dims));
             // Pinch (or Ctrl+wheel) and the plain wheel both zoom toward
             // the pointer (wheel up = in, like a map); a double-click
-            // toggles a quick 2× at that spot.
-            let (pinch, wheel) = if over_bar {
+            // toggles a quick 2× at that spot. Not while Settings is up:
+            // a wheel over the dialog must not zoom the video behind it.
+            let (pinch, wheel) = if over_bar || self.settings.open {
                 (1.0, 0.0)
             } else {
-                ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta().y))
+                ui.input(|i| {
+                    (
+                        i.zoom_delta() * self.pinch_factor,
+                        i.smooth_scroll_delta().y,
+                    )
+                })
             };
             if pinch != 1.0 {
                 f.set_zoom(avail, base, f.zoom * pinch, resp.hover_pos());
@@ -225,7 +231,7 @@ impl App {
         };
 
         if let Some(pb) = &mut f.playback
-            && pb.show_bar(ui, avail)
+            && pb.show_bar(ui, avail, self.pinch_factor)
         {
             self.prefs.playback_speed = pb.speed;
             self.prefs.save();

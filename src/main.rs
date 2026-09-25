@@ -19,6 +19,8 @@ mod config;
 mod decode;
 mod events;
 mod focused;
+#[cfg(target_os = "linux")]
+mod gesture;
 mod gpu;
 mod grid;
 mod isapi;
@@ -275,6 +277,11 @@ pub struct App {
     pub instance_lock: Option<std::fs::File>,
     /// Close requested: this frame paints "Closing…", the next one exits.
     closing: bool,
+    /// Touchpad pinch via XInput (gesture.rs); winit delivers it on macOS only.
+    #[cfg(target_os = "linux")]
+    pinch: Option<gesture::Pinch>,
+    /// This frame's pinch factor from there (1 = none), on top of egui's.
+    pinch_factor: f32,
     /// HIK_DEBUG UI-loop stats: updates + time inside ui() per report window.
     dbg_frames: u32,
     dbg_spent: std::time::Duration,
@@ -399,6 +406,20 @@ impl App {
             snap_rx,
             instance_lock,
             closing: false,
+            #[cfg(target_os = "linux")]
+            pinch: {
+                use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+                match cc.window_handle().map(|h| h.as_raw()) {
+                    Ok(RawWindowHandle::Xlib(h)) => {
+                        gesture::Pinch::start(h.window as u32, cc.egui_ctx.clone())
+                    }
+                    Ok(RawWindowHandle::Xcb(h)) => {
+                        gesture::Pinch::start(h.window.get(), cc.egui_ctx.clone())
+                    }
+                    _ => None,
+                }
+            },
+            pinch_factor: 1.0,
             dbg_frames: 0,
             dbg_spent: std::time::Duration::ZERO,
             dbg_win_start: Instant::now(),
@@ -1359,6 +1380,10 @@ impl eframe::App for App {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ui.ctx().request_repaint();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.pinch_factor = self.pinch.as_ref().map_or(1.0, gesture::Pinch::take);
         }
         let ctx = ui.ctx().clone();
         // Fresh ISAPI snapshots replace the cached placeholders, unbadged.

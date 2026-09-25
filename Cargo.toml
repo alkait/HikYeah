@@ -22,3 +22,4 @@ libc = "0.2.189"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "0.38"
+x11rb = { version = "0.13", features = ["xinput"] }
