@@ -236,8 +236,9 @@ impl App {
             .recorder
             .as_ref()
             .map(|r| r.started.elapsed().as_secs());
-        let audio = f.playback.is_none() && f.main.audio.load(std::sync::atomic::Ordering::Relaxed);
-        let audio_failed = audio && f.main.stats.lock().unwrap().audio_error.is_some();
+        let audio_sh = f.playback.as_ref().map_or(&f.main, |pb| pb.audio_shared());
+        let audio = audio_sh.audio.load(std::sync::atomic::Ordering::Relaxed);
+        let audio_failed = audio && audio_sh.stats.lock().unwrap().audio_error.is_some();
         if rec.is_some() || f.zoomed() || audio {
             let mut reset = false;
             egui::Area::new(egui::Id::new("focused badges"))

@@ -6,13 +6,17 @@
 // after PLAY). Speaking RTSP directly gets the first frame on screen in
 // ~0.3 s and lets us send the `Scale:` header for fast playback natively.
 //
-// Scope: TCP-interleaved RTP, video track only, digest auth, HEVC (RFC 7798)
-// and H.264 (RFC 6184) depacketization into Annex B. The Mac feeds its own
+// Scope: TCP-interleaved RTP, digest auth, HEVC (RFC 7798) and H.264
+// (RFC 6184) depacketization into Annex B, and for playback the NVR's
+// G.711 audio track (channel 2, raw samples) decoded on this thread while
+// the user has audio on. The Mac feeds its own
 // parser; here the NAL stream is written into a sink — ffmpeg's stdin, for
 // decoding (stream.rs) or for muxing a clip (media.rs). Timestamps aren't
 // taken from RTP — the NVR paces delivery at the requested speed, and the
 // decoder stamps frames on arrival, exactly like the live path.
 
+use crate::audio;
+use ffmpeg_next as ff;
 use md5::{Digest, Md5};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
@@ -55,10 +59,13 @@ impl Session {
 /// depacketize into `sink` until the NVR stops sending (or `stop`). Status
 /// strings go to `state` ("connecting…", failures, "ended"); dropping the
 /// sink when the thread ends is what tells the consumer the stream is over.
+/// `audio`: the stream whose flag and stats drive the audio track (playback);
+/// None sets up video only.
 pub fn start(
     req: Request,
     sink: impl Write + Send + 'static,
     state: impl Fn(&str) + Send + 'static,
+    audio: Option<Arc<crate::stream::Shared>>,
 ) -> Session {
     let stopped = Arc::new(AtomicBool::new(false));
     let sock = Arc::new(Mutex::new(None));
@@ -77,8 +84,12 @@ pub fn start(
             nonce: String::new(),
             session: String::new(),
             reader: None,
+            body: String::new(),
             fu: Vec::new(),
             state: Box::new(state),
+            audio_target: audio,
+            audio: None,
+            chan_seen: [0; 8],
         };
         c.run(&mut sink);
         let _ = sink.flush();
@@ -95,9 +106,15 @@ struct Client {
     nonce: String,
     session: String,
     reader: Option<BufReader<TcpStream>>,
+    /// The last response's body (DESCRIBE's SDP).
+    body: String,
     /// Fragmented-NAL reassembly.
     fu: Vec<u8>,
     state: Box<dyn Fn(&str) + Send>,
+    audio_target: Option<Arc<crate::stream::Shared>>,
+    audio: Option<audio::Slot>,
+    /// HIK_DEBUG: packets per interleaved channel (first one is logged).
+    chan_seen: [u32; 8],
 }
 
 /// RTSP keepalive — Hikvision expires sessions without traffic (~60 s).
@@ -150,6 +167,7 @@ impl Client {
         if resp.0 != 200 {
             return self.fail(&format!("playback refused ({})", resp.0));
         }
+        let sdp = std::mem::take(&mut self.body);
 
         let setup = self.request(
             "SETUP",
@@ -163,6 +181,7 @@ impl Client {
             return self.fail("playback setup failed");
         };
         self.session = sess;
+        self.setup_audio(&uri, &sdp);
 
         let session_header = format!("Session: {}", self.session);
         let range = format!("Range: clock={}-", self.req.start_clock);
@@ -183,8 +202,62 @@ impl Client {
         self.read_loop(sink);
     }
 
+    /// The NVR announces an audio track on every channel (G.711 µ-law,
+    /// 8 kHz mono, whether or not the camera has a mic — packets only come
+    /// for the ones that do). Set it up beside the video whenever a stream
+    /// wants it, so the toggle is instant: 64 kb/s on the socket, skipped
+    /// while off. Fast playback goes without — the NVR's sped-up audio is
+    /// not listenable.
+    fn setup_audio(&mut self, uri: &str, sdp: &str) {
+        let Some(sh) = self.audio_target.clone() else {
+            return;
+        };
+        let Some((id, rate, channels)) = sdp_audio(sdp) else {
+            sh.stats.lock().unwrap().audio_codec = None;
+            if std::env::var_os("HIK_DEBUG").is_some() {
+                eprintln!("[rtsp] no usable audio in SDP:\n{sdp}");
+            }
+            return;
+        };
+        {
+            let mut st = sh.stats.lock().unwrap();
+            st.audio_codec = Some(format!("{id:?}").to_lowercase());
+            st.audio_out = None;
+            st.audio_error = None;
+            if self.req.scale > 1 {
+                st.audio_out = Some(format!("muted at {}×", self.req.scale));
+                return;
+            }
+        }
+        let session = format!("Session: {}", self.session);
+        let resp = self.request(
+            "SETUP",
+            &format!("{uri}/trackID=audio"),
+            &[
+                "Transport: RTP/AVP/TCP;unicast;interleaved=2-3",
+                session.as_str(),
+            ],
+        );
+        if std::env::var_os("HIK_DEBUG").is_some() {
+            eprintln!(
+                "[rtsp] audio {id:?} {rate} Hz ch{channels}: SETUP {:?}",
+                resp.as_ref()
+                    .map(|r| (r.0, header_value(&r.1, "Transport").unwrap_or("")))
+            );
+        }
+        let ok = resp.is_some_and(|r| r.0 == 200);
+        if !ok {
+            sh.stats.lock().unwrap().audio_error = Some("audio setup refused".into());
+            return;
+        }
+        self.audio = Some(audio::Slot::new(
+            sh,
+            audio::Source::Raw { id, rate, channels },
+        ));
+    }
+
     /// After PLAY: interleaved binary frames ($-prefixed) mixed with the odd
-    /// RTSP text response (keepalive replies) — video is channel 0.
+    /// RTSP text response (keepalive replies) — video is channel 0, audio 2.
     fn read_loop(&mut self, sink: &mut impl Write) {
         let mut head = [0u8; 4];
         loop {
@@ -200,6 +273,19 @@ impl Client {
                 }
                 if channel == 0 && !self.handle_rtp(&payload, sink) {
                     return self.ended(); // sink gone (ffmpeg exited)
+                }
+                if channel == 2
+                    && let Some(a) = &mut self.audio
+                    && let Some((samples, _)) = rtp_payload(&payload)
+                {
+                    a.packet(&ff::Packet::borrow(samples));
+                }
+                if channel > 0 && std::env::var_os("HIK_DEBUG").is_some() {
+                    let n = self.chan_seen[usize::from(channel.min(7))];
+                    self.chan_seen[usize::from(channel.min(7))] = n + 1;
+                    if n == 0 {
+                        eprintln!("[rtsp] first packet on channel {channel}: {len} bytes");
+                    }
                 }
             } else if self.consume_text_response(&head).is_none() {
                 return self.ended();
@@ -257,26 +343,9 @@ impl Client {
 
     /// False when the sink is gone.
     fn handle_rtp(&mut self, p: &[u8], sink: &mut impl Write) -> bool {
-        if p.len() <= 12 || p[0] >> 6 != 2 {
+        let Some((payload, marker)) = rtp_payload(p) else {
             return true;
-        }
-        let mut offset = 12 + usize::from(p[0] & 0x0F) * 4; // fixed header + CSRCs
-        if p[0] & 0x10 != 0 {
-            // extension header
-            if p.len() < offset + 4 {
-                return true;
-            }
-            offset += 4 + (usize::from(p[offset + 2]) << 8 | usize::from(p[offset + 3])) * 4;
-        }
-        let mut end = p.len();
-        if p[0] & 0x20 != 0 {
-            end -= usize::from(p[end - 1]); // padding
-        }
-        if offset >= end {
-            return true;
-        }
-        let marker = p[1] & 0x80 != 0; // last packet of the access unit
-        let payload = &p[offset..end];
+        };
         let ok = match self.req.codec {
             "hevc" => self.depacketize_hevc(payload, sink),
             _ => self.depacketize_h264(payload, sink),
@@ -458,12 +527,14 @@ impl Client {
             }
         }
         let head = String::from_utf8_lossy(&acc).into_owned();
+        self.body.clear();
         if let Some(cl) =
             header_value(&head, "Content-Length").and_then(|v| v.parse::<usize>().ok())
             && cl > 0
         {
             let mut body = vec![0u8; cl];
             self.read_exact(&mut body).ok()?;
+            self.body = String::from_utf8_lossy(&body).into_owned();
         }
         Some(head)
     }
@@ -486,6 +557,49 @@ impl Client {
 
 /// `Name: value` from a response head (case-sensitive, like the Mac's
 /// regexes); the value stops at ';' or the line end.
+/// An RTP packet's payload (fixed header, CSRCs, extension and padding
+/// stripped) and its marker bit.
+fn rtp_payload(p: &[u8]) -> Option<(&[u8], bool)> {
+    if p.len() <= 12 || p[0] >> 6 != 2 {
+        return None;
+    }
+    let mut offset = 12 + usize::from(p[0] & 0x0F) * 4;
+    if p[0] & 0x10 != 0 {
+        if p.len() < offset + 4 {
+            return None;
+        }
+        offset += 4 + (usize::from(p[offset + 2]) << 8 | usize::from(p[offset + 3])) * 4;
+    }
+    let mut end = p.len();
+    if p[0] & 0x20 != 0 {
+        end -= usize::from(p[end - 1]);
+    }
+    if offset >= end {
+        return None;
+    }
+    Some((&p[offset..end], p[1] & 0x80 != 0))
+}
+
+/// The SDP's audio section as a decoder: G.711 (PCMU / PCMA) only — what
+/// Hikvision NVRs serve. Anything else (AAC would need RFC 3640
+/// depacketizing) reads as "no audio".
+fn sdp_audio(sdp: &str) -> Option<(ff::codec::Id, i32, i32)> {
+    let section = sdp.split("\nm=").find(|s| s.starts_with("audio"))?;
+    let rtpmap = section
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("a=rtpmap:"))?;
+    // "0 PCMU/8000" or "8 PCMA/8000/1"
+    let mut parts = rtpmap.split_whitespace().nth(1)?.split('/');
+    let id = match parts.next()? {
+        "PCMU" => ff::codec::Id::PCM_MULAW,
+        "PCMA" => ff::codec::Id::PCM_ALAW,
+        _ => return None,
+    };
+    let rate = parts.next().and_then(|r| r.parse().ok()).unwrap_or(8000);
+    let channels = parts.next().and_then(|c| c.parse().ok()).unwrap_or(1);
+    Some((id, rate, channels))
+}
+
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     let line = head
         .lines()

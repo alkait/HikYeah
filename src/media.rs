@@ -261,7 +261,7 @@ impl Recorder {
             .args(["-f", req.codec, "-i", "pipe:0", "-an", "-c:v", "copy"]);
         let mut child = Self::spawn(cmd, hevc, &path, true)?;
         let stdin = child.stdin.take().unwrap();
-        let feed = crate::rtsp::start(req, stdin, |_| {});
+        let feed = crate::rtsp::start(req, stdin, |_| {}, None);
         Ok(Recorder {
             child,
             path,

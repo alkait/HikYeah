@@ -684,14 +684,16 @@ impl App {
         });
     }
 
-    /// A: the focused camera's audio track on or off — live only (the
-    /// playback client carries no audio). Off at launch, never remembered.
+    /// A: the focused camera's audio on or off, live or playback. Off at
+    /// launch, never remembered; it follows the camera through playback.
     fn toggle_audio(&mut self) {
-        let Some(f) = &self.focused else {
+        let Some(f) = &mut self.focused else {
             return;
         };
-        if f.playback.is_some() {
-            self.flash("no audio in playback");
+        if let Some(pb) = &mut f.playback {
+            let on = !pb.audio;
+            pb.set_audio(on);
+            self.flash(if on { "audio on" } else { "audio off" });
             return;
         }
         let (codec, frames) = {
@@ -849,6 +851,7 @@ impl App {
                 vehicle: self.prefs.motion_filter.iter().any(|f| f == "vehicle"),
             },
         );
+        pb.audio = f.main.audio.load(std::sync::atomic::Ordering::Relaxed);
         // Default: a minute back.
         pb.begin(start_at.unwrap_or_else(|| chrono::Utc::now() - chrono::TimeDelta::seconds(60)));
         f.playback = Some(pb);
@@ -868,12 +871,12 @@ impl App {
         }
         let host = self.cams[f.idx].host.clone();
         let pos = pb.position();
+        let audio = pb.audio;
         drop(pb);
         f.note = None;
         if let Some(url) = self.cams[f.idx].main_url.clone() {
             let c = self.ctx.clone();
             // Audio survives the round trip through playback.
-            let audio = f.main.audio.load(std::sync::atomic::Ordering::Relaxed);
             f.main = stream::start(url, decode, true, REPAINT_COALESCE, move |d| {
                 repaint_after(&c, d)
             });

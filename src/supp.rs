@@ -543,6 +543,7 @@ impl App {
             },
             sink,
             |_| {},
+            None,
         );
         let pane = &mut self.supp.panes[i];
         pane.note = None;

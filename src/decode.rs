@@ -261,9 +261,7 @@ struct Session {
     /// while the user has it on (audio.rs).
     audio_index: Option<usize>,
     audio_codec: Option<String>,
-    audio: Option<crate::audio::Track>,
-    /// The output failed this session: reported once, not retried per packet.
-    audio_failed: bool,
+    audio: Option<crate::audio::Slot>,
     decoder: ff::decoder::Video,
     hw_fmt: Option<sys::AVPixelFormat>,
     hw_device: *mut sys::AVBufferRef,
@@ -346,7 +344,6 @@ impl Session {
             audio_index,
             audio_codec,
             audio: None,
-            audio_failed: false,
             decoder,
             hw_fmt,
             hw_device,
@@ -381,6 +378,15 @@ impl Session {
             Path::Software
         };
         sh.stats.lock().unwrap().audio_codec = self.audio_codec.clone();
+        self.audio = self.audio_index.map(|i| {
+            let params = self
+                .ictx
+                .streams()
+                .nth(i)
+                .expect("audio stream")
+                .parameters();
+            crate::audio::Slot::new(sh.clone(), crate::audio::Source::Params(params))
+        });
         loop {
             let packet = {
                 let mut pkt = ff::Packet::empty();
@@ -398,7 +404,9 @@ impl Session {
                 }
             };
             if self.audio_index == Some(packet.stream()) {
-                self.audio_packet(sh, &packet);
+                if let Some(a) = &mut self.audio {
+                    a.packet(&packet);
+                }
                 continue;
             }
             if packet.stream() != self.stream_index {
@@ -423,45 +431,6 @@ impl Session {
         let _ = self.decoder.send_eof();
         let _ = self.drain(sh, &mut pacer, live, path, wake);
         Ok(())
-    }
-
-    /// An audio packet: decoded and played while the flag is on, skipped
-    /// otherwise — the track is opened on the first packet after a toggle
-    /// on and dropped (device released) on the first after a toggle off.
-    fn audio_packet(&mut self, sh: &Arc<Shared>, packet: &ff::Packet) {
-        if !sh.audio.load(Ordering::Relaxed) {
-            if self.audio.take().is_some() {
-                sh.stats.lock().unwrap().audio_out = None;
-            }
-            self.audio_failed = false;
-            return;
-        }
-        if self.audio.is_none() && !self.audio_failed {
-            let params = self
-                .ictx
-                .streams()
-                .nth(packet.stream())
-                .expect("audio stream index")
-                .parameters();
-            match crate::audio::Track::open(params) {
-                Ok(track) => {
-                    let mut st = sh.stats.lock().unwrap();
-                    st.audio_out = Some(track.describe());
-                    st.audio_error = None;
-                    self.audio = Some(track);
-                }
-                Err(e) => {
-                    debug(&e);
-                    sh.stats.lock().unwrap().audio_error = Some(e);
-                    self.audio_failed = true;
-                }
-            }
-        }
-        if let Some(track) = &mut self.audio
-            && let Err(e) = track.feed(packet)
-        {
-            debug(&e);
-        }
     }
 
     fn drain(

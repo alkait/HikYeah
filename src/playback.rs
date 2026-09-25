@@ -16,6 +16,7 @@ use chrono::{DateTime, Datelike, Months, NaiveDate, TimeDelta, Utc};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -142,6 +143,9 @@ pub struct Playback {
     /// the last image across a seek or pause).
     pub shown: Arc<stream::Shared>,
     stream: Option<Live>,
+    /// Audio on (A). Every seek, pause and speed change makes a new pipe
+    /// session, so the flag lives here and is copied into each one.
+    pub audio: bool,
     /// 1 / 2 / 4 ×, shared across cameras (prefs).
     pub speed: u32,
     /// Guards a fail-retry loop.
@@ -218,6 +222,7 @@ impl Playback {
             decode,
             ctx,
             shown,
+            audio: false,
             stream: None,
             speed,
             last_start: Instant::now() - Duration::from_secs(60),
@@ -511,6 +516,7 @@ impl Playback {
             crate::REPAINT_COALESCE,
             move |d| crate::repaint_after(&ctx, d),
         );
+        shared.audio.store(self.audio, Ordering::Relaxed);
         let status = shared.clone();
         let ctx = self.ctx.clone();
         let session = rtsp::start(
@@ -529,9 +535,24 @@ impl Playback {
                 status.set_status(s);
                 ctx.request_repaint();
             },
+            Some(shared.clone()),
         );
         self.stream = Some(Live { shared, session });
         self.transport = Some((start, false));
+    }
+
+    pub fn set_audio(&mut self, on: bool) {
+        self.audio = on;
+        if let Some(s) = &self.stream {
+            s.shared.audio.store(on, Ordering::Relaxed);
+        }
+        self.shown.audio.store(on, Ordering::Relaxed);
+    }
+
+    /// The stream whose audio flag and stats are current: the running pipe,
+    /// or the last one while paused.
+    pub fn audio_shared(&self) -> &Arc<stream::Shared> {
+        self.stream.as_ref().map_or(&self.shown, |s| &s.shared)
     }
 
     /// The label keeps the pipe's last text across a pause (the Mac tile's

@@ -95,6 +95,7 @@ impl HelpContext {
                 ("S", "snapshot at this position"),
                 ("R", "record clip from here"),
                 ("B / ⇧B", "bookmark this moment / list"),
+                ("A", "audio on / off · muted at 2× / 4×"),
                 ("+ / −", "add / close a supplementary pane"),
                 ("I", "nerd stats"),
                 ("scroll", "timeline zoom · pan"),

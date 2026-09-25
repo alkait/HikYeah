@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -119,6 +119,9 @@ pub struct Shared {
     /// Play the camera's audio track (A on the focused camera). Off at
     /// launch, never remembered; the decoder checks it per audio packet.
     pub audio: AtomicBool,
+    /// Audio packets seen, on or off — in playback the NVR announces a
+    /// track for every camera and only sends packets for the ones with a mic.
+    pub audio_packets: AtomicU64,
     /// The frame currently on screen (renderer reads this).
     pub current: Mutex<Option<Frame>>,
     /// Frames scheduled for the future, front = next due.
