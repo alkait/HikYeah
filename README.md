@@ -1,15 +1,14 @@
 # HikYeah
 
-A fast, quiet viewer for Hikvision cameras and NVRs on Linux, macOS and
+A fast, simple viewer for Hikvision cameras and NVRs on Linux, macOS and
 Windows.
 
-Most camera software makes a laptop hot: one decoder process per camera,
-frames copied through the CPU several times, a discrete GPU woken up for
-nothing. HikYeah exists to watch a wall of cameras all day without the fan
-spinning up. Video decodes in-process with the FFmpeg libraries and goes
-straight to the GPU; on Linux with an Intel iGPU every stream decodes on the
-media engine and is displayed with zero copies. Sixteen cameras in a grid
-cost about a tenth of one CPU core.
+Hikvision's own software is slow, unintuitive and a chore to use every day.
+HikYeah exists so that looking at your cameras is instant and obvious: open
+it and the grid is there, double-click a camera to see it big, press one key
+to scrub through what the NVR recorded. No plugins, no browser, no menus
+three levels deep. Under the hood it is light too, so it can stay open all
+day on a laptop.
 
 ## Highlights
 
