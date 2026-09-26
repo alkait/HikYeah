@@ -82,6 +82,12 @@ fn main() -> eframe::Result {
     #[cfg(not(target_os = "linux"))]
     let instance_lock: Option<std::fs::File> = None;
 
+    if std::env::var_os("HIK_DEBUG").is_some() {
+        // wgpu/winit explain their failures (e.g. a Metal call that came back
+        // nil) only through `log`; without a sink those reasons vanish.
+        let _ = log::set_boxed_logger(Box::new(DebugLog));
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     decode::init();
     let app_prefs = prefs::Prefs::load();
     stream::SMOOTH.store(app_prefs.smooth_live, std::sync::atomic::Ordering::Relaxed);
@@ -1271,6 +1277,20 @@ fn single_instance_lock() -> Option<std::fs::File> {
             None
         }
     }
+}
+
+struct DebugLog;
+
+impl log::Log for DebugLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{}] {}: {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
 }
 
 /// HikViewer's icon, handed to eframe at startup: on macOS that sets the

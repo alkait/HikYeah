@@ -13,6 +13,7 @@ serde_json = "1.0.151"
 ureq = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 md-5 = "0.10"
+log = "0.4"
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "device", "software-scaling", "software-resampling"] }
 cpal = "0.18"
 
@@ -24,3 +25,21 @@ libc = "0.2.189"
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "0.38"
 x11rb = { version = "0.13", features = ["xinput"] }
+
+# wgpu picks the Metal shader language version from the OS version alone;
+# OpenCore Legacy Patcher Macs (current macOS, old GPU) ship a Metal
+# compiler that stops earlier, and every shader failed to compile. The
+# fork probes the compiler once per adapter and steps down
+# (wgpu-hal/src/metal/adapter.rs). Drop once upstream carries it.
+[patch.crates-io]
+wgpu = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-core = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-hal = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-types = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-naga-bridge = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-core-deps-apple = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-core-deps-emscripten = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+wgpu-core-deps-wasm = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+naga = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }
+naga-types = { git = "https://github.com/alkait/wgpu", rev = "3d22d71b16960d8078574d18cd1496d42ded73de" }

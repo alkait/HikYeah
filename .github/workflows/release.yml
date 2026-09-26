@@ -17,6 +17,8 @@ jobs:
             target: linux-x86_64
           - os: macos-latest
             target: macos-arm64
+          - os: macos-15-intel
+            target: macos-x86_64
           - os: windows-latest
             target: windows-x86_64
     runs-on: ${{ matrix.os }}
@@ -96,7 +98,8 @@ jobs:
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/release/hikyeah "$app/Contents/MacOS/"
           cp Resources/AppIcon.icns "$app/Contents/Resources/"
-          curl -fsSL -A "Mozilla/5.0" -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip
+          arch=$([ "$(uname -m)" = arm64 ] && echo arm64 || echo amd64)
+          curl -fsSL -A "Mozilla/5.0" -o ff.zip "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$arch/release/ffmpeg.zip"
           unzip -o ff.zip -d ffdl
           cp ffdl/ffmpeg "$app/Contents/MacOS/"
           chmod +x "$app/Contents/MacOS/ffmpeg"

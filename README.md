@@ -33,7 +33,7 @@ day on a laptop.
 
 ## Install
 
-**Linux (x86_64) and macOS (Apple Silicon):** one command installs the
+**Linux (x86_64) and macOS (Apple Silicon or Intel):** one command installs the
 latest release, verifies its checksum, and can be re-run at any time to
 update.
 

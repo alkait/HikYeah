@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HikYeah curl|bash installer (Linux x86_64, macOS Apple Silicon).
+# HikYeah curl|bash installer (Linux x86_64, macOS Apple Silicon and Intel).
 #
 # Usage:
 #   /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/install.sh)"
@@ -58,8 +58,11 @@ case "$OS" in
     APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     ;;
   Darwin)
-    [[ "$(uname -m)" == "arm64" ]] || die "only Apple Silicon macOS builds are published (got $(uname -m))"
-    ASSET_SUFFIX="macos-arm64.app.zip"
+    case "$(uname -m)" in
+      arm64) ASSET_SUFFIX="macos-arm64.app.zip" ;;
+      x86_64) ASSET_SUFFIX="macos-x86_64.app.zip" ;;
+      *) die "unsupported macOS architecture: $(uname -m)" ;;
+    esac
     SHA256="shasum -a 256"
     DEST="/Applications/HikYeah.app"
     # /Applications is admin-writable without sudo on a stock Mac; if not,
@@ -173,7 +176,8 @@ else
 
   echo
   ok "HikYeah $TAG installed at $DEST"
-  if [[ ! -d /opt/homebrew/opt/ffmpeg@8/lib ]]; then
+  # Homebrew lives in /opt/homebrew on Apple Silicon, /usr/local on Intel.
+  if [[ ! -d /opt/homebrew/opt/ffmpeg@8/lib && ! -d /usr/local/opt/ffmpeg@8/lib ]]; then
     warn "Homebrew's ffmpeg@8 is missing — HikYeah links its libraries:"
     warn "  brew install ffmpeg@8"
   fi
