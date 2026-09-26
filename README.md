@@ -96,3 +96,8 @@ cargo build --release
 Snapshots, clips and the decoder probe call the `ffmpeg` binary: the one
 next to the executable if present (releases bundle it), otherwise the one
 on PATH.
+
+## License
+
+[MIT](LICENSE). The release archives bundle FFmpeg, which is GPL; its
+notice files sit next to the binary.

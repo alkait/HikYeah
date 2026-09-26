@@ -2,6 +2,7 @@
 name = "hikyeah"
 version = "0.7.3"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 digest_auth = "0.3.1"
