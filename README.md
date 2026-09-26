@@ -1,187 +1,98 @@
 # HikYeah
 
-Cross-platform (Linux/Windows/macOS) port of
-[HikViewer](https://github.com/alkait/HikViewer): a live grid of your
-Hikvision cameras, any of them one double-click away from a full-window
-main-stream view with digital zoom, and recorded playback straight from
-your NVR with a calendar, a 24-hour timeline and up to 4× speed.
+A fast, quiet viewer for Hikvision cameras and NVRs on Linux, macOS and
+Windows.
 
-Pipeline: the FFmpeg libraries decode in-process (libavformat speaks RTSP,
-libavcodec decodes). On Linux with an Intel iGPU rendering the window, every
-stream decodes on the iGPU's media engine via VAAPI and each surface is
-exported as a DMA-BUF and sampled by the shader as-is — **zero copies**, no
-CPU pixels, and a discrete GPU stays asleep (the VideoToolbox arrangement,
-with Linux primitives). Elsewhere the chosen decoder (NVDEC, VAAPI, Quick
-Sync, …, or the CPU) hands pictures to wgpu textures (I420 as three R8
-planes, NV12 as R8 + RG8), converted to RGB in a WGSL shader during egui's
-render pass. Only the latest frame is ever shown, so latency can't
-accumulate; a stream reconnects forever on exit or stall, like the Mac app.
-The `ffmpeg` binary is used only for clips, playback snapshots and the
-decoder probe.
+Most camera software makes a laptop hot: one decoder process per camera,
+frames copied through the CPU several times, a discrete GPU woken up for
+nothing. HikYeah exists to watch a wall of cameras all day without the fan
+spinning up. Video decodes in-process with the FFmpeg libraries and goes
+straight to the GPU; on Linux with an Intel iGPU every stream decodes on the
+media engine and is displayed with zero copies. Sixteen cameras in a grid
+cost about a tenth of one CPU core.
 
-Measured on a 16-camera laptop (Intel iGPU + NVIDIA), whole app: grid 11%
-of one core, a 4K camera view 18%, 4× playback of a 4K stream 26% — down
-from 70%, 90% and 635% with the original ffmpeg-per-camera pipes.
+## Highlights
 
-## Install (Linux, macOS)
+- **Live grid** of all your cameras, reorderable by drag, with a selection
+  cursor for keyboard-only use.
+- **Focused view**: double-click a tile for a full-window main-stream view
+  with digital zoom (wheel or pinch, up to 8×) and pan.
+- **Recorded playback** straight from the NVR: a calendar of days with
+  footage, a zoomable 24-hour timeline, seek by click, 1× / 2× / 4× speed,
+  and audio where the NVR recorded it.
+- **Snapshots and clips** at full resolution, live or from the playback
+  position, with no re-encoding.
+- **Audio** for live streams that carry it.
+- **Hardware decoding** where it helps: VAAPI, NVDEC, Quick Sync,
+  VideoToolbox or Direct3D 11, chosen in Settings after a startup probe.
+- **Always current**: only the latest frame is ever shown, so latency never
+  accumulates, and a dropped stream reconnects on its own.
+- **Diagnostics panel** with per-stream frame rate, jitter, stalls, decoder
+  and CPU cost, for when something looks off.
+- **Self-updating**: one command installs, and the app offers new releases
+  from Settings.
 
-One command installs (and later updates — just re-run it, or use
-**Settings → Check for updates**). It fetches the latest release and verifies
-its SHA-256. On Linux it installs to `~/.local/share/hikyeah` (with the FFmpeg
-libraries and `ffmpeg` binary bundled), symlinks `~/.local/bin/hikyeah`, and
-adds a desktop entry. On macOS (Apple Silicon) it drops `HikYeah.app` into
-`/Applications`, quarantine-free; the app links Homebrew's FFmpeg 8
-libraries, so run `brew install ffmpeg@8` first.
+## Install
+
+**Linux (x86_64) and macOS (Apple Silicon):** one command installs the
+latest release, verifies its checksum, and can be re-run at any time to
+update.
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/install.sh)"
 ```
 
-To uninstall on Linux (asks before touching your camera config or prefs;
-on macOS just delete `/Applications/HikYeah.app`):
+On Linux this puts the app, with FFmpeg bundled, in `~/.local/share/hikyeah`,
+links `~/.local/bin/hikyeah`, and adds a desktop entry. On macOS it puts
+`HikYeah.app` in `/Applications`; the app uses Homebrew's FFmpeg 8 libraries,
+so run `brew install ffmpeg@8` first.
+
+**Windows (x86_64):** download the zip from
+[Releases](https://github.com/alkait/HikYeah/releases), extract it anywhere,
+and run `hikyeah.exe`. Everything it needs is in the folder.
+
+To uninstall on Linux:
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/uninstall.sh)"
 ```
 
-Prefer manual? Grab your platform's archive from
-[Releases](https://github.com/alkait/HikYeah/releases), extract, run. The
-Linux and Windows archives are self-contained. The macOS one needs
-`brew install ffmpeg@8`, and a browser download carries the quarantine flag
-that stops an ad-hoc-signed app from launching: clear it with
-`xattr -dr com.apple.quarantine HikYeah.app` (the install command avoids
-this).
-
-## Run
-
-```sh
-cargo build --release
-./target/release/hikyeah rtsp://user:pass@host:554/Streaming/Channels/102
-./target/release/hikyeah --test    # ffmpeg synthetic test pattern, no camera
-./target/release/hikyeah           # first camera from config (below)
-```
-
-Building needs the FFmpeg development libraries and libclang (for the
-bindings): Arch `pacman -S ffmpeg clang`; Ubuntu/Debian `apt install
-libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev
-libavfilter-dev pkg-config libclang-dev`; macOS `brew install ffmpeg@8
-pkg-config` with `PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig`. Any FFmpeg from 6 to 9 works; releases pin BtbN's 8.1 shared
-build via `FFMPEG_DIR`. For clips and playback snapshots the app runs the
-`ffmpeg` sitting next to its executable if there is one (release archives
-bundle it), else `ffmpeg` from PATH.
+On macOS delete `/Applications/HikYeah.app`; on Windows delete the folder.
 
 ## First run
 
-With no cameras configured the Settings window opens by itself: press **+**,
-enter the camera's host, username, password and RTSP port, and optionally
-let **Detect** read its name and codec from the camera. **Save** starts the
-grid. Mixed fleets with different credentials are fine. Optionally fill the
-**NVR (for playback)** row — host, user, password — to enable recorded
-playback; see the Mac app's README for the least-privilege NVR account and
-the permissions it needs.
+With no cameras configured, Settings opens by itself. Press **+**, enter a
+camera's host, user, password and RTSP port, and let **Detect** fill in its
+name and codec. **Save** starts the grid. To enable recorded playback, fill in
+the NVR row with its host, user and password; the app works out which channel
+each camera is on.
 
-The config is one JSON file, the same format as the Mac app's File > Export,
-so a setup moves between machines as a plain file copy (it contains the
-passwords in clear — treat it as a secret):
+Press **?** in the app for the full list of keyboard shortcuts.
+
+Your camera list is one JSON file you can copy between machines. It holds
+the passwords in clear, so treat it as a secret.
 
 | OS | Path |
 |---|---|
 | Linux | `~/.config/hikviewer/config.json` |
-| macOS | `~/Library/Application Support/hikviewer/config.json` (shared with HikViewer) |
+| macOS | `~/Library/Application Support/hikviewer/config.json` |
 | Windows | `%APPDATA%\hikviewer\config.json` |
 
-## Everyday use
+## Build from source
 
-| Action | Effect |
-|---|---|
-| Double-click a tile | focus it full-window (switches to the camera's main stream) |
-| `Esc` | back to the grid |
-| Arrow keys | move a red selection cursor between tiles; `Return` focuses it |
-| Long-press + drag a tile | reorder the grid (order is saved); `Esc` cancels |
-| `P` | recorded playback of the focused camera (from the NVR) |
-| `S` | snapshot of the focused camera (full resolution, from the camera itself; the frame at the playhead in playback) |
-| `R` | start / stop recording a clip of the focused camera (from the playhead in playback) |
-| `A` | audio of the focused camera on / off — live (cameras whose stream carries an audio track) and playback (channels the NVR records with audio; muted at 2× / 4×) |
-| `I` | nerd stats panel (focused camera, or the selected grid tile) |
-| `?` | keyboard shortcut help |
-| `F11` | toggle full screen |
-| `Ctrl-,` | Settings |
+Rust stable, the FFmpeg development libraries (any of 6 through 9) and
+libclang for the bindings. Debian/Ubuntu: `apt install libavcodec-dev
+libavformat-dev libavutil-dev libswscale-dev libavdevice-dev pkg-config
+libclang-dev`. Arch: `pacman -S ffmpeg clang`. macOS: `brew install ffmpeg@8
+pkg-config` and `PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig`.
 
-**Digital zoom** (focused view): mouse wheel or pinch zooms toward the pointer
-(1×–8×), double-click for a quick 2× at that spot (again to restore), drag to
-pan. A `2.4× ✕` badge top-right shows the level — click it to reset — and
-`Esc` zooms out first before leaving the view.
+```sh
+cargo build --release
+./target/release/hikyeah                       # cameras from the config
+./target/release/hikyeah rtsp://user:pass@host:554/Streaming/Channels/102
+./target/release/hikyeah --test                # synthetic test pattern
+```
 
-**Snapshots & clips** land on your Desktop (home if there is none — or any
-folder you set under "Save captures to" in Settings) as
-`Camera 2026-07-20 14.32.05.jpg/.mp4`, and a dialog then lets you type over
-that name — `Return` keeps it, `Esc` or Discard deletes the capture. Nothing
-is ever overwritten. `S` fires a shutter flash the instant you press it. `R` records the
-main stream with no re-encode (video only, fragmented MP4 so even a hard quit
-leaves a playable file); a red `● REC` badge counts up, and the clip also
-stops when you leave the camera.
-
-### Playback (recorded footage from the NVR)
-
-On a **focused** camera press **`P`** — playback resumes from that camera's
-last position (a minute back the first time). A bar appears at the bottom:
-play/pause, the date (click for a **calendar** — days with recordings are
-teal), a 24-hour timeline with recorded ranges in teal, a zoom button and a
-speed button (1× → 2× → 4×, also the `X` key — one remembered choice shared
-by all cameras). Click the timeline to jump anywhere; the live substream
-keeps running underneath, so `Esc` back to live is instant.
-
-| Key | Effect |
-|---|---|
-| `Space` | pause / resume |
-| `←` / `→` | seek ±10 s (`Shift`: ±60 s, `Ctrl`: ±15 min) |
-| `0`–`9` | jump to that tenth of the footage in view (YouTube style) |
-| `X` | cycle speed 1× / 2× / 4× |
-| `C` | calendar (arrows move, `Return` picks a day) |
-| `T` | jump to today |
-| `S` / `R` | snapshot / record clip at this position |
-| `P` or `Esc` | back to live |
-
-- **Timeline zoom:** the zoom button cycles 24h → 6h → 1h → 10m, or
-  scroll/pinch on the strip; horizontal scroll pans, and the window follows
-  the playhead while playing.
-- Playback pauses when it reaches the live edge or a gap with nothing after
-  it. No per-camera setup is needed: the app asks the NVR which channel each
-  camera is plugged into and matches it to your camera list; a camera the NVR
-  doesn't record shows "not recorded on this NVR".
-- Playback speaks RTSP to the NVR itself (digest auth, interleaved TCP, the
-  `Scale` header for fast playback) and pipes the elementary stream into
-  ffmpeg for decoding: a seek is on screen in about half a second, where
-  ffmpeg's own RTSP client sits on the NVR's initial burst for ~4 s. Clips
-  at 2×/4× go through the same native session, so they play back at the
-  watched speed.
-- Every ISAPI/RTSP timestamp from the NVR is its **local time** with a fake
-  `Z`; the app reads the NVR's UTC offset from `/ISAPI/System/time` and
-  formats everything in that zone.
-
-**Nerd stats** (`I`): a draggable panel of live diagnostics — stream and
-decode device, measured fps, arrival jitter (σ + worst gap), stalls and
-reconnects, the smoothing buffer's headroom, re-anchors and late frames,
-app + ffmpeg CPU, and Wi-Fi signal. Hover a row's name for what the number
-means; values turn amber/red past trouble thresholds; `⧉` copies a plain-text
-snapshot. A stream that goes silent for 12 s is killed and reconnected (that
-is a "stall"). Bitrate and GOP are not shown: ffmpeg hands the app decoded
-frames, so the compressed stream never passes through.
-
-**Settings** also holds "Always start in full screen", "Remember where I left
-off" (the grid or the camera you quit from — in playback, at that position;
-`state.json` next to the config uses the Mac app's format so both share it
-on macOS), "Smooth live video" (~0.2 s
-buffer absorbing Wi-Fi jitter; untick for minimum latency), the decode device
-(CPU, NVDEC, Quick Sync, VAAPI, … — only those that pass a startup probe are
-listed; it applies to the main stream and playback, while the grid's small
-substreams decode on the CPU, where a hardware decode plus download was
-measured to cost more than it saves) and the render adapter. On a laptop
-with an Intel iGPU, pick the iGPU as the render adapter: every stream then
-takes the zero-copy VAAPI path regardless of the decode setting, and the
-discrete GPU stays asleep with its fan off.
-
-## Not ported yet
-
-Motion/intrusion highlights on the timeline, bookmarks, intrusion review and
-supplementary panes.
+Snapshots, clips and the decoder probe call the `ffmpeg` binary: the one
+next to the executable if present (releases bundle it), otherwise the one
+on PATH.
