@@ -85,14 +85,17 @@ jobs:
       # install.sh (curl, no quarantine xattr) is the supported path. The
       # ffmpeg binary sits next to the executable, where stream::ffmpeg_path
       # looks first; ditto keeps the signature intact where zip would not.
+      # Resources/AppIcon.icns is HikViewer's icon set (all ten sizes, so
+      # Spotlight and the Dock have one at every scale).
       - name: Bundle (macOS)
         if: runner.os == 'macOS'
         run: |
           dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
           app="$dir/HikYeah.app"
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          mkdir -p "$app/Contents/MacOS"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/release/hikyeah "$app/Contents/MacOS/"
+          cp Resources/AppIcon.icns "$app/Contents/Resources/"
           curl -fsSL -A "Mozilla/5.0" -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip
           unzip -o ff.zip -d ffdl
           cp ffdl/ffmpeg "$app/Contents/MacOS/"
@@ -107,6 +110,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>HikYeah</string>
             <key>CFBundleIdentifier</key><string>com.alkait.hikyeah</string>
             <key>CFBundleExecutable</key><string>hikyeah</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>$v</string>
             <key>CFBundleVersion</key><string>$v</string>
