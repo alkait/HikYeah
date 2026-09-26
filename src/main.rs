@@ -141,6 +141,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(app_icon())
             .with_inner_size([1440.0, 810.0])
             .with_fullscreen(app_prefs.start_fullscreen && configured),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
@@ -1270,6 +1271,15 @@ fn single_instance_lock() -> Option<std::fs::File> {
             None
         }
     }
+}
+
+/// HikViewer's icon, handed to eframe at startup: on macOS that sets the
+/// Dock/app-switcher image directly (NSApp.setApplicationIconImage), so an
+/// update in place shows it even while LaunchServices still caches the
+/// old bundle registration; on X11 it is the window icon.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../Resources/AppIcon-512.png"))
+        .expect("bundled icon decodes")
 }
 
 /// Spawn a fresh instance (same binary, same args) and exit this one on the
