@@ -51,11 +51,33 @@ jobs:
           mkdir ffshared && tar xf ff.tar.xz -C ffshared --strip-components=1
           echo "FFMPEG_DIR=$PWD/ffshared" >> "$GITHUB_ENV"
           echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags' >> "$GITHUB_ENV"
+      # Homebrew has no Intel bottle for ffmpeg@8, so the x86_64 runner
+      # compiles it (~45 min); the built keg is cached by formula version
+      # and only its bottled dependencies are installed on a hit.
+      - name: FFmpeg formula version (macOS)
+        if: runner.os == 'macOS'
+        id: ffver
+        run: |
+          brew update --quiet # the Intel runner's snapshot predates ffmpeg@8
+          echo "version=$(brew info --json=v2 ffmpeg@8 | jq -r '.formulae[0].versions.stable')" >> "$GITHUB_OUTPUT"
+          echo "cellar=$(brew --cellar)/ffmpeg@8" >> "$GITHUB_OUTPUT"
+      - name: FFmpeg keg cache (macOS)
+        if: runner.os == 'macOS'
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.ffver.outputs.cellar }}
+          key: ffmpeg8-${{ runner.os }}-${{ runner.arch }}-${{ steps.ffver.outputs.version }}
       - name: FFmpeg libraries (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew update --quiet # the Intel runner's snapshot predates ffmpeg@8
-          brew install ffmpeg@8 pkg-config
+          if [ "${{ steps.ffcache.outputs.cache-hit }}" = "true" ]; then
+            brew install --only-dependencies ffmpeg@8
+            brew link ffmpeg@8
+          else
+            brew install ffmpeg@8
+          fi
+          brew install pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: FFmpeg libraries (Windows)
         if: runner.os == 'Windows'
