@@ -54,6 +54,7 @@ jobs:
       - name: FFmpeg libraries (macOS)
         if: runner.os == 'macOS'
         run: |
+          brew update --quiet # the Intel runner's snapshot predates ffmpeg@8
           brew install ffmpeg@8 pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: FFmpeg libraries (Windows)
