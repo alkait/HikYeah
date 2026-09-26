@@ -51,33 +51,38 @@ jobs:
           mkdir ffshared && tar xf ff.tar.xz -C ffshared --strip-components=1
           echo "FFMPEG_DIR=$PWD/ffshared" >> "$GITHUB_ENV"
           echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags' >> "$GITHUB_ENV"
-      # Homebrew has no Intel bottle for ffmpeg@8, so the x86_64 runner
-      # compiles it (~45 min); the built keg is cached by formula version
-      # and only its bottled dependencies are installed on a hit.
-      - name: FFmpeg formula version (macOS)
+      # Homebrew has no Intel bottles for ffmpeg@8 and a good part of its
+      # dependency tree (x265, openssl, libvpx, ...), so the x86_64 runner
+      # compiles them (~45 min). Every keg in the closure, with its opt
+      # link, is cached under a hash of all their versions; a hit restores
+      # them in seconds and Homebrew then sees them as installed.
+      - name: FFmpeg formula versions (macOS)
         if: runner.os == 'macOS'
         id: ffver
         run: |
           brew update --quiet # the Intel runner's snapshot predates ffmpeg@8
-          echo "version=$(brew info --json=v2 ffmpeg@8 | jq -r '.formulae[0].versions.stable')" >> "$GITHUB_OUTPUT"
-          echo "cellar=$(brew --cellar)/ffmpeg@8" >> "$GITHUB_OUTPUT"
+          deps=$(brew deps -n ffmpeg@8)
+          {
+            echo "kegs<<EOF"
+            for f in ffmpeg@8 $deps; do
+              echo "$(brew --cellar)/$f"
+              echo "$(brew --prefix)/opt/$f"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          brew info --json=v2 ffmpeg@8 $deps | jq -r '.formulae[] | "\(.name) \(.versions.stable)"' > ffmpeg-kegs.txt
+          cat ffmpeg-kegs.txt
       - name: FFmpeg keg cache (macOS)
         if: runner.os == 'macOS'
         id: ffcache
         uses: actions/cache@v4
         with:
-          path: ${{ steps.ffver.outputs.cellar }}
-          key: ffmpeg8-${{ runner.os }}-${{ runner.arch }}-${{ steps.ffver.outputs.version }}
+          path: ${{ steps.ffver.outputs.kegs }}
+          key: ffmpeg8-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ffmpeg-kegs.txt') }}
       - name: FFmpeg libraries (macOS)
         if: runner.os == 'macOS'
         run: |
-          if [ "${{ steps.ffcache.outputs.cache-hit }}" = "true" ]; then
-            brew install --only-dependencies ffmpeg@8
-            brew link ffmpeg@8
-          else
-            brew install ffmpeg@8
-          fi
-          brew install pkg-config
+          brew install ffmpeg@8 pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: FFmpeg libraries (Windows)
         if: runner.os == 'Windows'
