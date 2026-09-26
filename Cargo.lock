@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "android-activity"
-version = "0.7.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f2a1bb052857d5dd49572219344a7332b31b76405648eabac5bc68978251bcd"
 dependencies = [
@@ -1622,7 +1622,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hikyeah"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "ash",
  "chrono",
@@ -2655,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "peniko"
-version = "0.7.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "839c8299360d2e998bdb106dc0a6cd71dcc5f4df51df1b620361bf50e283cca6"
 dependencies = [
