@@ -1283,6 +1283,21 @@ pub fn relaunch(lock: Option<std::fs::File>) -> ! {
         if let Some(orig) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
             exe = orig.into();
         }
+        // Inside a bundle, relaunch through LaunchServices so the Dock and
+        // window manager see a normal app launch, not a bare process.
+        #[cfg(target_os = "macos")]
+        if let Some(app) = exe
+            .ancestors()
+            .find(|p| p.extension().is_some_and(|e| e == "app"))
+        {
+            let _ = std::process::Command::new("open")
+                .arg("-n")
+                .arg(app)
+                .arg("--args")
+                .args(std::env::args().skip(1))
+                .spawn();
+            std::process::exit(0);
+        }
         let _ = std::process::Command::new(exe)
             .args(std::env::args().skip(1))
             .spawn();

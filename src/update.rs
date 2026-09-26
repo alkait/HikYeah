@@ -35,6 +35,12 @@ pub enum Msg {
 
 /// Whether this binary runs from the installer's directory. A source build
 /// (target/release, anywhere else) must not have the installer write over it.
+#[cfg(target_os = "macos")]
+pub fn installed() -> bool {
+    std::env::current_exe().is_ok_and(|exe| exe.starts_with("/Applications/HikYeah.app"))
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn installed() -> bool {
     let dir = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
@@ -93,12 +99,14 @@ fn fetch_latest() -> Result<Release, String> {
 }
 
 /// Run the installer; it swaps the install dir under us (our process and its
-/// ffmpeg children keep their old inodes until the relaunch).
+/// ffmpeg children keep their old inodes until the relaunch). HIKYEAH_INAPP
+/// tells it we quit and relaunch ourselves.
 pub fn apply(tx: Sender<Msg>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let out = std::process::Command::new("bash")
             .arg("-c")
             .arg(format!("/bin/bash -c \"$(curl -fsSL {INSTALLER_URL})\""))
+            .env("HIKYEAH_INAPP", "1")
             .output();
         let msg = match out {
             Ok(o) if o.status.success() => Msg::Installed,

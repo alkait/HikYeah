@@ -23,18 +23,22 @@ Measured on a 16-camera laptop (Intel iGPU + NVIDIA), whole app: grid 11%
 of one core, a 4K camera view 18%, 4× playback of a 4K stream 26% — down
 from 70%, 90% and 635% with the original ffmpeg-per-camera pipes.
 
-## Install (Linux)
+## Install (Linux, macOS)
 
-One command installs (and later updates — just re-run it). It fetches the
-latest release, verifies its SHA-256, installs to `~/.local/share/hikyeah`
-(with the FFmpeg libraries and `ffmpeg` binary bundled), symlinks
-`~/.local/bin/hikyeah`, and adds a desktop entry:
+One command installs (and later updates — just re-run it, or use
+**Settings → Check for updates**). It fetches the latest release and verifies
+its SHA-256. On Linux it installs to `~/.local/share/hikyeah` (with the FFmpeg
+libraries and `ffmpeg` binary bundled), symlinks `~/.local/bin/hikyeah`, and
+adds a desktop entry. On macOS (Apple Silicon) it drops `HikYeah.app` into
+`/Applications`, quarantine-free; the app links Homebrew's FFmpeg 8
+libraries, so run `brew install ffmpeg@8` first.
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/install.sh)"
 ```
 
-To uninstall (asks before touching your camera config or prefs):
+To uninstall on Linux (asks before touching your camera config or prefs;
+on macOS just delete `/Applications/HikYeah.app`):
 
 ```sh
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/HikYeah/releases/latest/download/uninstall.sh)"
@@ -42,8 +46,11 @@ To uninstall (asks before touching your camera config or prefs):
 
 Prefer manual? Grab your platform's archive from
 [Releases](https://github.com/alkait/HikYeah/releases), extract, run. The
-Linux and Windows archives are self-contained; the macOS one needs
-`brew install ffmpeg` (the app links Homebrew's FFmpeg libraries).
+Linux and Windows archives are self-contained. The macOS one needs
+`brew install ffmpeg@8`, and a browser download carries the quarantine flag
+that stops an ad-hoc-signed app from launching: clear it with
+`xattr -dr com.apple.quarantine HikYeah.app` (the install command avoids
+this).
 
 ## Run
 
@@ -57,8 +64,8 @@ cargo build --release
 Building needs the FFmpeg development libraries and libclang (for the
 bindings): Arch `pacman -S ffmpeg clang`; Ubuntu/Debian `apt install
 libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev
-libavfilter-dev pkg-config libclang-dev`; macOS `brew install ffmpeg
-pkg-config`. Any FFmpeg from 6 to 9 works; releases pin BtbN's 8.1 shared
+libavfilter-dev pkg-config libclang-dev`; macOS `brew install ffmpeg@8
+pkg-config` with `PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig`. Any FFmpeg from 6 to 9 works; releases pin BtbN's 8.1 shared
 build via `FFMPEG_DIR`. For clips and playback snapshots the app runs the
 `ffmpeg` sitting next to its executable if there is one (release archives
 bundle it), else `ffmpeg` from PATH.

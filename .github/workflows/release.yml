@@ -39,8 +39,8 @@ jobs:
       # 8.1 branch; their libav*.so/.dll carry every codec dependency inside),
       # located through FFMPEG_DIR at build time; the Linux binary gets an
       # $ORIGIN rpath so the bundled .so files resolve from the archive.
-      # macOS builds against Homebrew's ffmpeg and stays unbundled (no Mac
-      # users yet): it needs `brew install ffmpeg` of the same major.
+      # macOS builds against Homebrew's ffmpeg@8 (the plain `ffmpeg` formula
+      # is already 9.x) and stays unbundled: it needs `brew install ffmpeg@8`.
       - name: FFmpeg libraries (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -51,7 +51,9 @@ jobs:
           echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags' >> "$GITHUB_ENV"
       - name: FFmpeg libraries (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg pkg-config
+        run: |
+          brew install ffmpeg@8 pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: FFmpeg libraries (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -79,19 +81,45 @@ jobs:
           tar czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
 
+      # HikYeah.app, the HikViewer way: ad-hoc signed (no Developer ID), so
+      # install.sh (curl, no quarantine xattr) is the supported path. The
+      # ffmpeg binary sits next to the executable, where stream::ffmpeg_path
+      # looks first; ditto keeps the signature intact where zip would not.
       - name: Bundle (macOS)
         if: runner.os == 'macOS'
         run: |
           dir=hikyeah-${{ github.ref_name }}-${{ matrix.target }}
-          mkdir "$dir"
+          app="$dir/HikYeah.app"
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p "$app/Contents/MacOS"
+          cp target/release/hikyeah "$app/Contents/MacOS/"
           curl -fsSL -A "Mozilla/5.0" -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip
           unzip -o ff.zip -d ffdl
-          cp ffdl/ffmpeg "$dir/"
-          chmod +x "$dir/ffmpeg"
-          echo "Bundled ffmpeg binary: GPL build from https://ffmpeg.martin-riedl.de (source: https://ffmpeg.org, license: https://ffmpeg.org/legal.html). The app itself links Homebrew's FFmpeg libraries: brew install ffmpeg." > "$dir/FFMPEG-NOTICE.txt"
-          cp target/release/hikyeah "$dir/"
-          tar czf "$dir.tar.gz" "$dir"
-          shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+          cp ffdl/ffmpeg "$app/Contents/MacOS/"
+          chmod +x "$app/Contents/MacOS/ffmpeg"
+          echo "Bundled ffmpeg binary: GPL build from https://ffmpeg.martin-riedl.de (source: https://ffmpeg.org, license: https://ffmpeg.org/legal.html). The app itself links Homebrew's FFmpeg libraries: brew install ffmpeg@8." > "$dir/FFMPEG-NOTICE.txt"
+          printf 'APPL????' > "$app/Contents/PkgInfo"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>HikYeah</string>
+            <key>CFBundleDisplayName</key><string>HikYeah</string>
+            <key>CFBundleIdentifier</key><string>com.alkait.hikyeah</string>
+            <key>CFBundleExecutable</key><string>hikyeah</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$v</string>
+            <key>CFBundleVersion</key><string>$v</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>HikYeah connects to your cameras and NVR on the local network.</string>
+          </dict></plist>
+          PLIST
+          codesign --force --sign - --deep "$app"
+          codesign -dv "$app" 2>&1 | grep -E 'Identifier|adhoc'
+          ditto -c -k --keepParent "$dir" "$dir.app.zip"
+          shasum -a 256 "$dir.app.zip" > "$dir.app.zip.sha256"
 
       - name: Bundle (Windows)
         if: runner.os == 'Windows'
