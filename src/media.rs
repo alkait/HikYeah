@@ -203,7 +203,8 @@ fn pdeathsig(cmd: &mut Command) {
 
 /// One in-flight clip: an ffmpeg stream-copy mux independent of the viewing
 /// pipeline (ClipRecorder.swift), so pausing/seeking never disturbs the
-/// file. Input is either ffmpeg's own RTSP pull (live from the camera,
+/// file. A clip carries sound when the audio was on (A) as R was pressed —
+/// what you hear is what you get. Input is either ffmpeg's own RTSP pull (live from the camera,
 /// playback from the NVR at 1×) or — for fast playback, where ffmpeg can't
 /// send the `Scale:` header — Annex B NALs pushed in through stdin from a
 /// native RTSP session, stamped by arrival time so the clip plays back at
@@ -224,6 +225,7 @@ impl Recorder {
     pub fn start(
         url: &str,
         hevc: bool,
+        audio: bool,
         name: &str,
         stamp: &str,
         host: String,
@@ -232,7 +234,14 @@ impl Recorder {
         let path = unique_path(dir, name, stamp, "mp4");
         let mut cmd = Command::new(crate::stream::ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
-            .args(["-rtsp_transport", "tcp", "-i", url, "-an", "-c:v", "copy"]);
+            .args(["-rtsp_transport", "tcp", "-i", url, "-c:v", "copy"]);
+        // MP4 can't carry the cameras' G.711, so sound is re-encoded (8 kHz
+        // mono — negligible CPU); the video is still a copy.
+        cmd.args(if audio {
+            ["-c:a", "aac"]
+        } else {
+            ["-an", "-sn"]
+        });
         let child = Self::spawn(cmd, hevc, &path, false)?;
         Ok(Recorder {
             child,

@@ -1021,6 +1021,14 @@ impl App {
         };
         let cam = &self.cams[idx];
         let hevc = stored.codec != "h264";
+        // Sound goes into the clip when it's on and actually arriving: the
+        // NVR announces a track on every channel, and a silent one would
+        // stall the mux waiting for packets that never come.
+        let audio = self.focused.as_ref().is_some_and(|f| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let sh = f.playback.as_ref().map_or(&f.main, |pb| pb.audio_shared());
+            sh.audio.load(Relaxed) && sh.audio_packets.load(Relaxed) > 0
+        });
         let result = match self.focused.as_ref().and_then(|f| f.playback.as_ref()) {
             Some(pb) => {
                 let pos = pb.position();
@@ -1052,6 +1060,7 @@ impl App {
                     media::Recorder::start(
                         &pb.client.rtsp_url(&path),
                         hevc,
+                        audio,
                         &cam.name,
                         &stamp,
                         cam.host.clone(),
@@ -1062,6 +1071,7 @@ impl App {
             None => media::Recorder::start(
                 &config::rtsp_url(&stored, config::MAIN_CHANNEL),
                 hevc,
+                audio,
                 &cam.name,
                 &media::stamp(chrono::Local::now()),
                 cam.host.clone(),
