@@ -82,6 +82,13 @@ jobs:
       - name: FFmpeg libraries (macOS)
         if: runner.os == 'macOS'
         run: |
+          # ffmpeg@8 moved to openssl@4 while the runner images still link
+          # openssl@3 (and openssl@1.1 on Intel): pouring openssl@4 inside the
+          # ffmpeg@8 install then dies on brew's own lock ("already locked
+          # Cellar/openssl@3"), or exits 1 on a failed link. Unlink the old
+          # kegs and install openssl@4 on its own first.
+          for k in openssl@1.1 openssl@3; do brew unlink "$k" 2>/dev/null || true; done
+          brew install openssl@4
           brew install ffmpeg@8 pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@8)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: FFmpeg libraries (Windows)
